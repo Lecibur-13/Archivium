@@ -36,6 +36,10 @@ root_app = None
 logs_frame = None
 logs_toggle_btn = None
 logs_visible = False
+# Cancelación y estado de transferencia
+cancel_event = None
+is_transferring = False
+transfer_thread = None
 # Fuente seleccionada y fuentes CTk (si corresponde)
 UI_FONT_FAMILY = "Arial"
 BASE_FONT = None
@@ -138,13 +142,27 @@ def transfer_with_python(src, dest, patterns, move=False, progress_cb=None, kind
     import fnmatch, shutil
     count = 0
     exclude_dirs = {"$RECYCLE.BIN","System Volume Information"}
-    for root,dirs,files in os.walk(src):
+    for root, dirs, files in os.walk(src):
+        # detener temprano si se solicitó cancelación
+        try:
+            if cancel_event is not None and cancel_event.is_set():
+                log("Transfer cancelled by user.")
+                return count
+        except Exception:
+            pass
         # filtrar directorios excluidos
         dirs[:] = [d for d in dirs if d not in exclude_dirs]
         for fn in files:
+            # chequeo de cancelación por archivo
+            try:
+                if cancel_event is not None and cancel_event.is_set():
+                    log("Transfer cancelled by user.")
+                    return count
+            except Exception:
+                pass
             f = fn.lower()
             if any(fnmatch.fnmatch(f, pat.lower()) for pat in patterns):
-                src_path = os.path.join(root,fn)
+                src_path = os.path.join(root, fn)
                 target = unique_dest_path(dest, fn)
                 if move:
                     shutil.move(src_path, target)
@@ -159,6 +177,7 @@ def transfer_with_python(src, dest, patterns, move=False, progress_cb=None, kind
                 if count % 100 == 0:
                     log(f"{count} files copied to {dest}")
     log(f"Copied {count} files to {dest} (flat)")
+    return count
 
 def do_transfer(src, session_dir, move=False):
     jpeg_dir = os.path.join(session_dir,"JPEG")
@@ -216,24 +235,52 @@ def do_transfer(src, session_dir, move=False):
         pct = 0.0 if total_all == 0 else done["count"] / total_all
         update_progress(pct, kind, filename)
 
+    # Detener si se canceló antes de iniciar
+    if cancel_event is not None and cancel_event.is_set():
+        return
     transfer_with_python(src, jpeg_dir, JPEG_PATTERNS, move=move, progress_cb=progress_cb, kind="JPEG")
+    if cancel_event is not None and cancel_event.is_set():
+        return
     transfer_with_python(src, raw_dir,  RAW_PATTERNS,  move=move, progress_cb=progress_cb, kind="RAW")
+    if cancel_event is not None and cancel_event.is_set():
+        return
     transfer_with_python(src, video_dir,VIDEO_PATTERNS, move=move, progress_cb=progress_cb, kind="Video")
 
 def organize():
+    global cancel_event, is_transferring, transfer_thread
     src = src_var.get().strip(); dest = dest_var.get().strip(); move = move_var.get()
+
+    # Si ya está transfiriendo, el mismo botón sirve para cancelar
+    if is_transferring:
+        try:
+            if cancel_event is not None:
+                cancel_event.set()
+            status_var.set("Cancelando...")
+        except Exception:
+            pass
+        log("Cancelling transfer requested by user.")
+        return
+
     if not dest:
         messagebox.showerror(APP_NAME, "Select destination folder."); return
     if not src:
         messagebox.showerror(APP_NAME, "Select source folder."); return
+
     session_name = next_sequence_folder(dest); session_dir = os.path.join(dest,session_name)
     ensure_dirs(session_dir); log(f"Session: {session_dir}")
 
-    # Deshabilitar UI mientras corre
+    # Mientras corre, el botón dice "Cancelar" pero permanece habilitado
     def set_busy(state: bool):
-        organize_btn.configure(state="disabled" if state else "normal")
-        format_btn.configure(state="disabled")
+        try:
+            if state:
+                organize_btn.configure(text="Cancelar")
+            else:
+                organize_btn.configure(text="Organize")
+        except Exception:
+            pass
+
     set_busy(True)
+    show_progress()
 
     # Reset progreso
     try:
@@ -247,28 +294,40 @@ def organize():
         pass
 
     import threading
+    cancel_event = threading.Event()
+    is_transferring = True
+
     def _worker():
+        global cancel_event, is_transferring, transfer_thread
         try:
             do_transfer(src, session_dir, move=move)
-            log("Transfer complete.")
-            root_app.after(0, format_btn.configure, {"state":"normal"})
-            root_app.after(0, status_var.set, f"Done: {session_dir}")
-            # Completar barra
-            try:
-                if 'USE_CTK' in globals() and USE_CTK:
-                    root_app.after(0, progress_bar.set, 1.0)
-                else:
-                    root_app.after(0, progress_bar.configure, {"value":100})
-            except Exception:
-                pass
-            root_app.after(0, messagebox.showinfo, APP_NAME, "Transfer finished. You may format the SD if you want.")
+            if cancel_event is not None and cancel_event.is_set():
+                log("Transfer cancelled.")
+                root_app.after(0, status_var.set, "Cancelled")
+            else:
+                log("Transfer complete.")
+                root_app.after(0, status_var.set, f"Done: {session_dir}")
+                # Completar barra
+                try:
+                    if 'USE_CTK' in globals() and USE_CTK:
+                        root_app.after(0, progress_bar.set, 1.0)
+                    else:
+                        root_app.after(0, progress_bar.configure, {"value":100})
+                except Exception:
+                    pass
+                root_app.after(0, messagebox.showinfo, APP_NAME, "Transfer finished.")
         except Exception as e:
             log("Error: "+str(e))
             root_app.after(0, messagebox.showerror, APP_NAME, f"Error during transfer:\n{e}")
         finally:
+            is_transferring = False
+            cancel_event = None
+            transfer_thread = None
             root_app.after(0, set_busy, False)
             root_app.after(0, hide_progress)
-    threading.Thread(target=_worker, daemon=True).start()
+
+    transfer_thread = threading.Thread(target=_worker, daemon=True)
+    transfer_thread.start()
 
 def format_sd():
     src = src_var.get().strip()
@@ -474,9 +533,7 @@ def build_gui():
         logs_toggle_btn.grid(row=5, column=0, sticky="w", padx=12, pady=(0,12))
         organize_btn = ctk.CTkButton(frm, text="Organize", command=organize, fg_color="#2563eb", hover_color="#1d4ed8", text_color="#ffffff", font=BASE_FONT)
         organize_btn.grid(row=5, column=1, sticky="w", padx=(0,12), pady=(0,12))
-        format_btn = ctk.CTkButton(frm, text="Format SD", command=format_sd, fg_color="#ef4444", hover_color="#dc2626", text_color="#ffffff", font=BASE_FONT)
-        format_btn.grid(row=5, column=2, sticky="w", padx=(0,12), pady=(0,12))
-        format_btn.configure(state="disabled")
+        # Format button removed
         # Estado y progreso
         ctk.CTkLabel(frm, textvariable=status_var, font=BASE_FONT).grid(row=6, column=0, columnspan=3, sticky="ew", padx=12, pady=(0,4))
         progress_bar = ctk.CTkProgressBar(frm)
@@ -528,7 +585,7 @@ def build_gui():
         logs_toggle_btn = ttk.Button(frm,text="Show log",command=toggle_logs, style='Ghost.TButton')
         logs_toggle_btn.grid(row=5,column=0,sticky="w")
         organize_btn = ttk.Button(frm,text="Organize",command=organize, style='Primary.TButton'); organize_btn.grid(row=5,column=1,sticky="w")
-        format_btn = ttk.Button(frm,text="Format SD",command=format_sd, style='Danger.TButton'); format_btn.grid(row=5,column=2,sticky="w"); format_btn.configure(state="disabled")
+        # Format button removed (ttk)
         # Estado y progreso
         ttk.Label(frm,textvariable=status_var, style='FieldLabel.TLabel').grid(row=6,column=0,columnspan=3,sticky="w",pady=(4,4))
         progress_bar = ttk.Progressbar(frm, maximum=100, mode="determinate")
