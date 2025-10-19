@@ -134,7 +134,7 @@ def unique_dest_path(dest, filename):
 
 # Plano: copiar/mover sin subcarpetas, solo archivos que coinciden
 
-def transfer_with_python(src, dest, patterns, move=False):
+def transfer_with_python(src, dest, patterns, move=False, progress_cb=None, kind=None):
     import fnmatch, shutil
     count = 0
     exclude_dirs = {"$RECYCLE.BIN","System Volume Information"}
@@ -151,6 +151,11 @@ def transfer_with_python(src, dest, patterns, move=False):
                 else:
                     shutil.copy2(src_path, target)
                 count += 1
+                if progress_cb:
+                    try:
+                        progress_cb(1, fn, kind or "Files")
+                    except Exception:
+                        pass
                 if count % 100 == 0:
                     log(f"{count} files copied to {dest}")
     log(f"Copied {count} files to {dest} (flat)")
@@ -159,12 +164,61 @@ def do_transfer(src, session_dir, move=False):
     jpeg_dir = os.path.join(session_dir,"JPEG")
     raw_dir  = os.path.join(session_dir,"RAW")
     video_dir= os.path.join(session_dir,"Video")
+
+    # Helpers: contar y actualizar progreso
+    def count_matching_files(src_dir, patterns):
+        import fnmatch
+        total = 0
+        exclude_dirs = {"$RECYCLE.BIN","System Volume Information"}
+        for r, d, files in os.walk(src_dir):
+            d[:] = [x for x in d if x not in exclude_dirs]
+            for fn in files:
+                f = fn.lower()
+                if any(fnmatch.fnmatch(f, pat.lower()) for pat in patterns):
+                    total += 1
+        return total
+
+    def update_progress(pct, kind, filename):
+        import threading
+        text = f"Copying {kind}: {int(pct*100)}% — {filename}"
+        def _ui():
+            try:
+                status_var.set(text)
+            except Exception:
+                pass
+            try:
+                if progress_bar is not None:
+                    if 'USE_CTK' in globals() and USE_CTK:
+                        progress_bar.set(pct)
+                    else:
+                        progress_bar['value'] = int(pct*100)
+            except Exception:
+                pass
+        if threading.current_thread() is threading.main_thread():
+            _ui()
+        else:
+            root_app.after(0, _ui)
+
+    total_jpeg = count_matching_files(src, JPEG_PATTERNS)
+    total_raw  = count_matching_files(src, RAW_PATTERNS)
+    total_video= count_matching_files(src, VIDEO_PATTERNS)
+    total_all = total_jpeg + total_raw + total_video
+    done = {"count": 0}
+
+    update_progress(0.0, "Scanning", "")
+
     ensure_dirs(jpeg_dir, raw_dir, video_dir)
     # Modo plano: no mantener subcarpetas del origen
     log("Separating: JPEG, RAW, Video (flat mode)")
-    transfer_with_python(src, jpeg_dir, JPEG_PATTERNS, move=move)
-    transfer_with_python(src, raw_dir,  RAW_PATTERNS,  move=move)
-    transfer_with_python(src, video_dir,VIDEO_PATTERNS, move=move)
+
+    def progress_cb(increment, filename, kind):
+        done["count"] += increment
+        pct = 0.0 if total_all == 0 else done["count"] / total_all
+        update_progress(pct, kind, filename)
+
+    transfer_with_python(src, jpeg_dir, JPEG_PATTERNS, move=move, progress_cb=progress_cb, kind="JPEG")
+    transfer_with_python(src, raw_dir,  RAW_PATTERNS,  move=move, progress_cb=progress_cb, kind="RAW")
+    transfer_with_python(src, video_dir,VIDEO_PATTERNS, move=move, progress_cb=progress_cb, kind="Video")
 
 def organize():
     src = src_var.get().strip(); dest = dest_var.get().strip(); move = move_var.get()
@@ -181,6 +235,17 @@ def organize():
         format_btn.configure(state="disabled")
     set_busy(True)
 
+    # Reset progreso
+    try:
+        status_var.set("Starting...")
+        if progress_bar is not None:
+            if 'USE_CTK' in globals() and USE_CTK:
+                progress_bar.set(0.0)
+            else:
+                progress_bar.configure(value=0)
+    except Exception:
+        pass
+
     import threading
     def _worker():
         try:
@@ -188,12 +253,21 @@ def organize():
             log("Transfer complete.")
             root_app.after(0, format_btn.configure, {"state":"normal"})
             root_app.after(0, status_var.set, f"Done: {session_dir}")
+            # Completar barra
+            try:
+                if 'USE_CTK' in globals() and USE_CTK:
+                    root_app.after(0, progress_bar.set, 1.0)
+                else:
+                    root_app.after(0, progress_bar.configure, {"value":100})
+            except Exception:
+                pass
             root_app.after(0, messagebox.showinfo, APP_NAME, "Transfer finished. You may format the SD if you want.")
         except Exception as e:
             log("Error: "+str(e))
             root_app.after(0, messagebox.showerror, APP_NAME, f"Error during transfer:\n{e}")
         finally:
             root_app.after(0, set_busy, False)
+            root_app.after(0, hide_progress)
     threading.Thread(target=_worker, daemon=True).start()
 
 def format_sd():
@@ -304,8 +378,38 @@ def toggle_logs():
         logs_toggle_btn.configure(text='Hide log')
         logs_visible = True
 
+# Mostrar/ocultar barra de progreso
+def show_progress():
+    global progress_visible
+    try:
+        if 'USE_CTK' in globals() and USE_CTK:
+            if progress_bar is not None:
+                progress_bar.set(0.0)
+                progress_bar.grid()
+        else:
+            if progress_bar is not None:
+                progress_bar.configure(value=0)
+                progress_bar.grid()
+        progress_visible = True
+    except Exception:
+        pass
+
+def hide_progress():
+    global progress_visible
+    try:
+        if progress_bar is not None:
+            progress_bar.grid_remove()
+        progress_visible = False
+        # Limpiar estado textual opcionalmente
+        try:
+            status_var.set("")
+        except Exception:
+            pass
+    except Exception:
+        pass
+
 def build_gui():
-    global dest_var, src_var, move_var, status_var, root_app, organize_btn, format_btn, log_text, logs_frame, logs_toggle_btn, logs_visible
+    global dest_var, src_var, move_var, status_var, root_app, organize_btn, format_btn, log_text, logs_frame, logs_toggle_btn, logs_visible, progress_bar
     if 'USE_CTK' in globals() and USE_CTK:
         root = ctk.CTk(); root.title(APP_NAME)
         styles_obj = apply_styles(root, use_ctk=True)
@@ -362,7 +466,6 @@ def build_gui():
         src_entry.grid(row=0, column=0, sticky="ew", padx=(0,6))
         btn_src = ctk.CTkButton(src_row, text="📁", font=EMOJI_FONT, corner_radius=6, command=pick_src, fg_color="#1f2937", hover_color="#374151", text_color="#e2e8f0", width=48, height=34)
         btn_src.grid(row=0, column=1, sticky="e")
-        # Layout responsive automático: la entrada se expande, el botón permanece fijo.
         # Switch mover
         move_switch = ctk.CTkSwitch(frm, text="Move instead of copy (deletes from source)", variable=move_var, onvalue=True, offvalue=False, font=BASE_FONT)
         move_switch.grid(row=4, column=0, columnspan=3, sticky="w", padx=12, pady=(0,12))
@@ -374,9 +477,15 @@ def build_gui():
         format_btn = ctk.CTkButton(frm, text="Format SD", command=format_sd, fg_color="#ef4444", hover_color="#dc2626", text_color="#ffffff", font=BASE_FONT)
         format_btn.grid(row=5, column=2, sticky="w", padx=(0,12), pady=(0,12))
         format_btn.configure(state="disabled")
+        # Estado y progreso
+        ctk.CTkLabel(frm, textvariable=status_var, font=BASE_FONT).grid(row=6, column=0, columnspan=3, sticky="ew", padx=12, pady=(0,4))
+        progress_bar = ctk.CTkProgressBar(frm)
+        progress_bar.grid(row=7, column=0, columnspan=3, sticky="ew", padx=12, pady=(0,12))
+        progress_bar.set(0)
+        progress_bar.grid_remove()
         # Registro
         logs_frame = ctk.CTkFrame(frm, corner_radius=8)
-        logs_frame.grid(row=7, column=0, columnspan=3, sticky="nsew", padx=12, pady=(6,0))
+        logs_frame.grid(row=8, column=0, columnspan=3, sticky="nsew", padx=12, pady=(6,0))
         ctk.CTkLabel(logs_frame, text="Log:", font=LABEL_FONT_BOLD).grid(row=0, column=0, sticky="nw", padx=8, pady=(8,4))
         log_text = ctk.CTkTextbox(logs_frame, width=560, height=180, font=BASE_FONT)
         log_text.grid(row=1, column=0, sticky="nsew", padx=8, pady=(0,8))
@@ -384,7 +493,7 @@ def build_gui():
         # Colapsar por defecto
         logs_visible = False
         logs_frame.grid_remove()
-        frm.grid_rowconfigure(7, weight=1)
+        frm.grid_rowconfigure(8, weight=1)
         cfg = load_config();
         if cfg.get("default_dest"): dest_var.set(cfg["default_dest"]) 
         return root
@@ -420,9 +529,14 @@ def build_gui():
         logs_toggle_btn.grid(row=5,column=0,sticky="w")
         organize_btn = ttk.Button(frm,text="Organize",command=organize, style='Primary.TButton'); organize_btn.grid(row=5,column=1,sticky="w")
         format_btn = ttk.Button(frm,text="Format SD",command=format_sd, style='Danger.TButton'); format_btn.grid(row=5,column=2,sticky="w"); format_btn.configure(state="disabled")
+        # Estado y progreso
+        ttk.Label(frm,textvariable=status_var, style='FieldLabel.TLabel').grid(row=6,column=0,columnspan=3,sticky="w",pady=(4,4))
+        progress_bar = ttk.Progressbar(frm, maximum=100, mode="determinate")
+        progress_bar.grid(row=7,column=0,columnspan=3,sticky="ew",pady=(0,8))
+        progress_bar.configure(value=0)
         # Frame de registro (colapsable)
         logs_frame = ttk.Frame(frm)
-        logs_frame.grid(row=7,column=0,columnspan=3,sticky="nsew",pady=(6,0))
+        logs_frame.grid(row=8,column=0,columnspan=3,sticky="nsew",pady=(6,0))
         ttk.Label(logs_frame,text="Log:", style='FieldLabel.TLabel').grid(row=0,column=0,sticky="nw")
         log_text = tk.Text(logs_frame,height=10,width=80,state="disabled",bg="#0f172a",fg="#e5e7eb",relief="flat",highlightthickness=1,highlightbackground="#334155")
         log_text.grid(row=1,column=0,sticky="nsew")
@@ -431,7 +545,7 @@ def build_gui():
         logs_frame.columnconfigure(0, weight=1); logs_frame.rowconfigure(1, weight=1)
         logs_visible = False
         logs_frame.grid_remove()
-        frm.columnconfigure(0, weight=1); frm.rowconfigure(7, weight=1)
+        frm.columnconfigure(0, weight=1); frm.rowconfigure(8, weight=1)
         cfg = load_config();
         if cfg.get("default_dest"): dest_var.set(cfg["default_dest"]) 
         return root
