@@ -24,6 +24,10 @@ APP_ID = "Archivium"
 APPDATA_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), APP_ID)
 CONFIG_PATH = os.path.join(APPDATA_DIR, "config.json")
 DEFAULT_CONFIG = {"default_dest": ""}
+# App logo paths
+LOGO_PATH = os.path.join(os.path.dirname(__file__), "img", "logo.PNG")
+LOGO_ICO_PATH = os.path.join(os.path.dirname(__file__), "img", "logo.ico")
+HEADER_IMAGE_SIZE = 48
 
 JPEG_PATTERNS = ["*.jpg","*.jpeg","*.jpe","*.jfif"]
 RAW_PATTERNS  = ["*.cr2","*.cr3","*.nef","*.raf","*.arw","*.rw2","*.dng","*.orf","*.sr2","*.pef","*.nrw"]
@@ -109,6 +113,36 @@ def ensure_dirs(*dirs):
 def detect_drive_letter(path):
     drive,_ = os.path.splitdrive(os.path.abspath(path))
     return drive[0].upper() if drive and len(drive)>=2 and drive[1]==":" else None
+
+# --- App icon helpers ---
+def ensure_logo_icon():
+    # Create .ico from PNG if possible (for packaging)
+    try:
+        if Image is not None and os.path.exists(LOGO_PATH) and not os.path.exists(LOGO_ICO_PATH):
+            im = Image.open(LOGO_PATH).convert("RGBA")
+            sizes = [(16,16),(32,32),(48,48),(64,64),(128,128),(256,256)]
+            im.save(LOGO_ICO_PATH, format="ICO", sizes=sizes)
+    except Exception:
+        pass
+
+# Eliminar ensure_blank_icon y clear_window_icon
+
+def set_window_icon(root):
+    # Set window icon if logo.ico exists
+    try:
+        ensure_logo_icon()
+        if os.path.exists(LOGO_ICO_PATH):
+            root.iconbitmap(LOGO_ICO_PATH)
+    except Exception:
+        pass
+
+def clear_window_icon(root):
+    # Remove window icon and title text by setting logo icon
+    try:
+        logo = tk.PhotoImage(width=1, height=1)
+        root.iconphoto(True, logo)
+    except Exception:
+        pass
 
 def robocopy_available():
     from shutil import which
@@ -470,7 +504,8 @@ def hide_progress():
 def build_gui():
     global dest_var, src_var, move_var, status_var, root_app, organize_btn, format_btn, log_text, logs_frame, logs_toggle_btn, logs_visible, progress_bar
     if 'USE_CTK' in globals() and USE_CTK:
-        root = ctk.CTk(); root.title(APP_NAME)
+        root = ctk.CTk(); root.title("")
+        set_window_icon(root)
         styles_obj = apply_styles(root, use_ctk=True)
         # Fuentes locales tomadas del módulo de estilos
         TITLE_FONT = styles_obj.TITLE_FONT
@@ -486,28 +521,43 @@ def build_gui():
         status_var = tk.StringVar(root, value="")
         root.grid_columnconfigure(0, weight=1); root.grid_rowconfigure(1, weight=1)
         # Header
-        header = ctk.CTkFrame(root, corner_radius=12)
-        header.grid(row=0, column=0, sticky="ew", padx=12, pady=(12,6))
-        title = ctk.CTkLabel(header, text=APP_NAME, font=TITLE_FONT)
-        title.grid(row=0, column=0, sticky="w", padx=10, pady=8)
-        def on_appearance(value):
-            try:
-                ctk.set_appearance_mode("light" if value == "Light" else "dark")
-            except Exception:
-                pass
-        mode = ctk.CTkSegmentedButton(header, values=["Light","Dark"], command=on_appearance, font=SMALL_FONT)
-        mode.set("Dark")
-        mode.grid(row=0, column=1, sticky="e", padx=10, pady=8)
-        header.grid_columnconfigure(0, weight=1)
-        # Card de contenido
-        frm = ctk.CTkFrame(root, corner_radius=12)
-        frm.grid(row=1, column=0, sticky="nsew", padx=12, pady=(0,12))
-        # Col 0 expandible y col 1 fija (botón)
-        frm.grid_columnconfigure(0, weight=1)
-        frm.grid_columnconfigure(1, weight=0)
+        header = ctk.CTkFrame(root, corner_radius=0, height=40)
+        header.grid(row=0, column=0, sticky="ew")
+        header.grid_columnconfigure(1, weight=1)
+
+        # Title
+        title_label = ctk.CTkLabel(header, text="Archivium", font=TITLE_FONT)
+        title_label.grid(row=0, column=0, sticky="w", padx=20, pady=10)
+
+        # Theme switcher
+        theme_switcher_frame = ctk.CTkFrame(header, fg_color="transparent")
+        theme_switcher_frame.grid(row=0, column=1, sticky="e", padx=10, pady=10)
+
+        def set_appearance_mode(mode):
+            ctk.set_appearance_mode(mode)
+
+        theme_switcher = ctk.CTkSegmentedButton(
+            theme_switcher_frame,
+            values=["Light", "Dark"],
+            command=set_appearance_mode,
+            font=SMALL_FONT,
+            height=28,
+            selected_color="#334155",
+            selected_hover_color="#475569"
+        )
+        theme_switcher.set(ctk.get_appearance_mode())
+        theme_switcher.pack()
+        # Main content area
+        main_frame = ctk.CTkFrame(root, corner_radius=12)
+        main_frame.grid(row=1, column=0, sticky="nsew", padx=12, pady=(6,12))
+        main_frame.grid_columnconfigure(0, weight=1)
+        # Config frame
+        config_frame = ctk.CTkFrame(main_frame, fg_color="transparent")
+        config_frame.grid(row=0, column=0, sticky="ew", padx=15, pady=15)
+        config_frame.grid_columnconfigure(1, weight=1)
         # Fila destino
-        ctk.CTkLabel(frm, text="Destination (default):", font=LABEL_FONT_BOLD).grid(row=0, column=0, columnspan=3, sticky="w", padx=12, pady=(12,4))
-        dest_row = ctk.CTkFrame(frm)
+        ctk.CTkLabel(config_frame, text="Destination (default):", font=LABEL_FONT_BOLD).grid(row=0, column=0, columnspan=3, sticky="w", padx=12, pady=(12,4))
+        dest_row = ctk.CTkFrame(config_frame)
         dest_row.grid(row=1, column=0, columnspan=3, sticky="ew", padx=12, pady=(0,12))
         dest_row.grid_columnconfigure(0, weight=1)
         dest_row.grid_columnconfigure(1, weight=0)
@@ -516,8 +566,8 @@ def build_gui():
         btn_dest = ctk.CTkButton(dest_row, text="📁", font=EMOJI_FONT, corner_radius=6, command=pick_dest, fg_color="#1f2937", hover_color="#374151", text_color="#e2e8f0", width=48, height=34)
         btn_dest.grid(row=0, column=1, sticky="e")
         # Fila origen
-        ctk.CTkLabel(frm, text="Source (SD/Folder):", font=LABEL_FONT_BOLD).grid(row=2, column=0, columnspan=3, sticky="w", padx=12, pady=(0,4))
-        src_row = ctk.CTkFrame(frm)
+        ctk.CTkLabel(config_frame, text="Source (SD/Folder):", font=LABEL_FONT_BOLD).grid(row=2, column=0, columnspan=3, sticky="w", padx=12, pady=(0,4))
+        src_row = ctk.CTkFrame(config_frame)
         src_row.grid(row=3, column=0, columnspan=3, sticky="ew", padx=12, pady=(0,12))
         src_row.grid_columnconfigure(0, weight=1)
         src_row.grid_columnconfigure(1, weight=0)
@@ -526,23 +576,23 @@ def build_gui():
         btn_src = ctk.CTkButton(src_row, text="📁", font=EMOJI_FONT, corner_radius=6, command=pick_src, fg_color="#1f2937", hover_color="#374151", text_color="#e2e8f0", width=48, height=34)
         btn_src.grid(row=0, column=1, sticky="e")
         # Switch mover
-        move_switch = ctk.CTkSwitch(frm, text="Move instead of copy (deletes from source)", variable=move_var, onvalue=True, offvalue=False, font=BASE_FONT)
+        move_switch = ctk.CTkSwitch(config_frame, text="Move instead of copy (deletes from source)", variable=move_var, onvalue=True, offvalue=False, font=BASE_FONT)
         move_switch.grid(row=4, column=0, columnspan=3, sticky="w", padx=12, pady=(0,12))
         # Botones
-        logs_toggle_btn = ctk.CTkButton(frm, text="Show log", command=toggle_logs, fg_color="#334155", hover_color="#475569", text_color="#e2e8f0", font=BASE_FONT)
+        logs_toggle_btn = ctk.CTkButton(config_frame, text="Show log", command=toggle_logs, fg_color="#334155", hover_color="#475569", text_color="#e2e8f0", font=BASE_FONT)
         logs_toggle_btn.grid(row=5, column=0, sticky="w", padx=12, pady=(0,12))
-        organize_btn = ctk.CTkButton(frm, text="Organize", command=organize, fg_color="#2563eb", hover_color="#1d4ed8", text_color="#ffffff", font=BASE_FONT)
+        organize_btn = ctk.CTkButton(config_frame, text="Organize", command=organize, fg_color="#2563eb", hover_color="#1d4ed8", text_color="#ffffff", font=BASE_FONT)
         organize_btn.grid(row=5, column=1, sticky="w", padx=(0,12), pady=(0,12))
         # Format button removed
         # Estado y progreso
-        ctk.CTkLabel(frm, textvariable=status_var, font=BASE_FONT).grid(row=6, column=0, columnspan=3, sticky="ew", padx=12, pady=(0,4))
-        progress_bar = ctk.CTkProgressBar(frm)
-        progress_bar.grid(row=7, column=0, columnspan=3, sticky="ew", padx=12, pady=(0,12))
+        ctk.CTkLabel(main_frame, textvariable=status_var, font=BASE_FONT).grid(row=1, column=0, columnspan=3, sticky="ew", padx=12, pady=(0,4))
+        progress_bar = ctk.CTkProgressBar(main_frame)
+        progress_bar.grid(row=2, column=0, columnspan=3, sticky="ew", padx=12, pady=(0,12))
         progress_bar.set(0)
         progress_bar.grid_remove()
         # Registro
-        logs_frame = ctk.CTkFrame(frm, corner_radius=8)
-        logs_frame.grid(row=8, column=0, columnspan=3, sticky="nsew", padx=12, pady=(6,0))
+        logs_frame = ctk.CTkFrame(main_frame, corner_radius=8)
+        logs_frame.grid(row=3, column=0, columnspan=3, sticky="nsew", padx=12, pady=(6,0))
         ctk.CTkLabel(logs_frame, text="Log:", font=LABEL_FONT_BOLD).grid(row=0, column=0, sticky="nw", padx=8, pady=(8,4))
         log_text = ctk.CTkTextbox(logs_frame, width=560, height=180, font=BASE_FONT)
         log_text.grid(row=1, column=0, sticky="nsew", padx=8, pady=(0,8))
@@ -550,13 +600,14 @@ def build_gui():
         # Colapsar por defecto
         logs_visible = False
         logs_frame.grid_remove()
-        frm.grid_rowconfigure(8, weight=1)
+        main_frame.grid_rowconfigure(3, weight=1)
         cfg = load_config();
         if cfg.get("default_dest"): dest_var.set(cfg["default_dest"]) 
         return root
     else:
-        root = tk.Tk(); root.title(APP_NAME)
-        _ = apply_styles(root, use_ctk=False)
+        root = tk.Tk(); root.title("")
+        clear_window_icon(root)
+        styles_obj = apply_styles(root, use_ctk=False)
         root_app = root
         dest_var = tk.StringVar(root)
         src_var = tk.StringVar(root)
