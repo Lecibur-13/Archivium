@@ -29,7 +29,7 @@ LOGO_PATH = os.path.join(os.path.dirname(__file__), "img", "logo.PNG")
 LOGO_ICO_PATH = os.path.join(os.path.dirname(__file__), "img", "logo.ico")
 HEADER_IMAGE_SIZE = 48
 
-JPEG_PATTERNS = ["*.jpg","*.jpeg","*.jpe","*.jfif"]
+JPEG_PATTERNS = ["*.jpg","*.jpeg","*.jpe","*.jfif","*.png","*.gif","*.bmp","*.tiff","*.tif","*.webp","*.ico","*.svg","*.heic","*.heif"]
 RAW_PATTERNS  = ["*.cr2","*.cr3","*.nef","*.raf","*.arw","*.rw2","*.dng","*.orf","*.sr2","*.pef","*.nrw"]
 VIDEO_PATTERNS= ["*.mp4","*.mov","*.avi","*.mts","*.mxf","*.mpg","*.mpeg","*.mkv","*.wmv","*.3gp"]
 
@@ -260,7 +260,18 @@ def do_transfer(src, session_dir, move=False):
 
     update_progress(0.0, "Scanning", "")
 
-    ensure_dirs(jpeg_dir, raw_dir, video_dir)
+    # Solo crear directorios si hay archivos que copiar
+    dirs_to_create = []
+    if total_jpeg > 0:
+        dirs_to_create.append(jpeg_dir)
+    if total_raw > 0:
+        dirs_to_create.append(raw_dir)
+    if total_video > 0:
+        dirs_to_create.append(video_dir)
+    
+    if dirs_to_create:
+        ensure_dirs(*dirs_to_create)
+    
     # Modo plano: no mantener subcarpetas del origen
     log("Separating: JPEG, RAW, Video (flat mode)")
 
@@ -272,13 +283,18 @@ def do_transfer(src, session_dir, move=False):
     # Detener si se canceló antes de iniciar
     if cancel_event is not None and cancel_event.is_set():
         return
-    transfer_with_python(src, jpeg_dir, JPEG_PATTERNS, move=move, progress_cb=progress_cb, kind="JPEG")
+    
+    # Solo transferir si hay archivos del tipo correspondiente
+    if total_jpeg > 0:
+        transfer_with_python(src, jpeg_dir, JPEG_PATTERNS, move=move, progress_cb=progress_cb, kind="JPEG")
     if cancel_event is not None and cancel_event.is_set():
         return
-    transfer_with_python(src, raw_dir,  RAW_PATTERNS,  move=move, progress_cb=progress_cb, kind="RAW")
+    if total_raw > 0:
+        transfer_with_python(src, raw_dir,  RAW_PATTERNS,  move=move, progress_cb=progress_cb, kind="RAW")
     if cancel_event is not None and cancel_event.is_set():
         return
-    transfer_with_python(src, video_dir,VIDEO_PATTERNS, move=move, progress_cb=progress_cb, kind="Video")
+    if total_video > 0:
+        transfer_with_python(src, video_dir,VIDEO_PATTERNS, move=move, progress_cb=progress_cb, kind="Video")
 
 def organize():
     global cancel_event, is_transferring, transfer_thread
