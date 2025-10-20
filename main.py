@@ -3,7 +3,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 import tkinter.font as tkfont
 from styles import apply_styles
-# Añadimos soporte de imágenes (Pillow) si está disponible
+# Add image support (Pillow) if available
 try:
     from PIL import Image, ImageDraw, ImageTk
 except Exception:
@@ -16,14 +16,14 @@ try:
 except Exception:
     ctk = None
     USE_CTK = False
-# Referencias de iconos para evitar garbage collection
+
 icons = {}
 
 APP_NAME = "Archivium"
 APP_ID = "Archivium"
 APPDATA_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), APP_ID)
 CONFIG_PATH = os.path.join(APPDATA_DIR, "config.json")
-DEFAULT_CONFIG = {"default_dest": ""}
+DEFAULT_CONFIG = {"default_dest": "", "theme": "system"}
 # App logo paths
 LOGO_PATH = os.path.join(os.path.dirname(__file__), "img", "logo.PNG")
 LOGO_ICO_PATH = os.path.join(os.path.dirname(__file__), "img", "logo.ico")
@@ -40,11 +40,13 @@ root_app = None
 logs_frame = None
 logs_toggle_btn = None
 logs_visible = False
-# Cancelación y estado de transferencia
+CURRENT_SETTINGS_WINDOW = None
+USER_INTENDS_SETTINGS = False
+# Cancellation and transfer status
 cancel_event = None
 is_transferring = False
 transfer_thread = None
-# Fuente seleccionada y fuentes CTk (si corresponde)
+# Font configuration
 UI_FONT_FAMILY = "Arial"
 BASE_FONT = None
 TITLE_FONT = None
@@ -74,7 +76,6 @@ def log(text):
         log_text.insert("end", text+"\n")
         log_text.see("end")
         log_text.configure(state="disabled")
-    # Si estamos en hilo secundario, despachar al hilo principal
     if threading.current_thread() is threading.main_thread():
         _append()
     else:
@@ -98,424 +99,486 @@ def today_str(): return datetime.date.today().strftime("%Y-%m-%d")
 def next_sequence_folder(base):
     date_str = today_str(); prefix = date_str+"_"; seq = 1
     try:
-        for name in os.listdir(base):
-            dpath = os.path.join(base,name)
-            if os.path.isdir(dpath) and name.startswith(prefix):
-                m = re.match(rf"^{re.escape(date_str)}_(\d+)$", name)
-                if m:
-                    n = int(m.group(1)); seq = max(seq, n+1)
-    except FileNotFoundError: os.makedirs(base, exist_ok=True)
-    return f"{date_str}_{seq:03d}"
+        existing = [d for d in os.listdir(base) if os.path.isdir(os.path.join(base,d)) and d.startswith(prefix)]
+        if existing:
+            nums = []; pattern = re.compile(rf"^{re.escape(prefix)}(\d+)$")
+            for d in existing:
+                m = pattern.match(d)
+                if m: nums.append(int(m.group(1)))
+            if nums: seq = max(nums) + 1
+    except Exception: pass
+    return os.path.join(base, f"{prefix}{seq:02d}")
 
 def ensure_dirs(*dirs):
     for d in dirs: os.makedirs(d, exist_ok=True)
 
 def detect_drive_letter(path):
-    drive,_ = os.path.splitdrive(os.path.abspath(path))
-    return drive[0].upper() if drive and len(drive)>=2 and drive[1]==":" else None
+    if os.name == 'nt' and len(path) >= 2 and path[1] == ':': return path[0].upper()
+    return None
 
-# --- App icon helpers ---
 def ensure_logo_icon():
-    # Create .ico from PNG if possible (for packaging)
-    try:
-        if Image is not None and os.path.exists(LOGO_PATH) and not os.path.exists(LOGO_ICO_PATH):
-            im = Image.open(LOGO_PATH).convert("RGBA")
-            sizes = [(16,16),(32,32),(48,48),(64,64),(128,128),(256,256)]
-            im.save(LOGO_ICO_PATH, format="ICO", sizes=sizes)
-    except Exception:
-        pass
-
-# Eliminar ensure_blank_icon y clear_window_icon
+    if not os.path.exists(LOGO_ICO_PATH) and Image:
+        try:
+            if os.path.exists(LOGO_PATH):
+                img = Image.open(LOGO_PATH).convert("RGBA")
+                img.save(LOGO_ICO_PATH, format="ICO", sizes=[(32,32)])
+        except Exception: pass
 
 def set_window_icon(root):
-    # Set window icon if logo.ico exists
+    ensure_logo_icon()
     try:
-        ensure_logo_icon()
-        if os.path.exists(LOGO_ICO_PATH):
-            root.iconbitmap(LOGO_ICO_PATH)
-    except Exception:
-        pass
+        if os.path.exists(LOGO_ICO_PATH): root.iconbitmap(LOGO_ICO_PATH)
+    except Exception: pass
 
 def clear_window_icon(root):
-    # Remove window icon and title text by setting logo icon
-    try:
-        logo = tk.PhotoImage(width=1, height=1)
-        root.iconphoto(True, logo)
-    except Exception:
-        pass
+    try: root.iconbitmap("")
+    except Exception: pass
 
 def robocopy_available():
-    from shutil import which
-    return which("robocopy") is not None
+    try: subprocess.run(["robocopy", "/?"], capture_output=True, check=False); return True
+    except Exception: return False
 
 def transfer_with_robocopy(src, dest, patterns, move=False):
-    # Excluir carpetas de sistema al usar la raíz de la SD
-    exclude_dirs = ["$RECYCLE.BIN","System Volume Information"]
-    cmd = ["robocopy", src, dest] + patterns + ["/S","/R:1","/W:2","/MT:16","/NP","/NFL","/NDL","/XD"] + exclude_dirs
-    if move: cmd.append("/MOV")
-    log("Ejecutando: "+" ".join(cmd))
-    p = subprocess.run(cmd, capture_output=True, text=True)
-    log(p.stdout.strip() or "(sin salida)")
-    if p.stderr.strip(): log("STDERR: "+p.stderr.strip())
-    if p.returncode > 7: raise RuntimeError(f"robocopy fallo con codigo {p.returncode}")
-
-# Nuevo: generar nombres únicos en destino para evitar colisiones
+    cmd = ["robocopy", src, dest] + patterns
+    if move: cmd.append("/MOVE")
+    cmd.extend(["/E", "/R:3", "/W:1", "/NP", "/NDL", "/NFL"])
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        return result.returncode < 8
+    except Exception: return False
 
 def unique_dest_path(dest, filename):
-    base, ext = os.path.splitext(filename)
-    candidate = os.path.join(dest, filename)
-    idx = 2
-    while os.path.exists(candidate):
-        candidate = os.path.join(dest, f"{base}_{idx:02d}{ext}")
-        idx += 1
-    return candidate
-
-# Plano: copiar/mover sin subcarpetas, solo archivos que coinciden
+    base, ext = os.path.splitext(filename); counter = 1
+    while os.path.exists(os.path.join(dest, filename)):
+        filename = f"{base}_{counter}{ext}"; counter += 1
+    return os.path.join(dest, filename)
 
 def transfer_with_python(src, dest, patterns, move=False, progress_cb=None, kind=None):
-    import fnmatch, shutil
-    count = 0
-    exclude_dirs = {"$RECYCLE.BIN","System Volume Information"}
-    for root, dirs, files in os.walk(src):
-        # detener temprano si se solicitó cancelación
+    import shutil, fnmatch, threading
+    global cancel_event
+    if cancel_event and cancel_event.is_set(): return False
+    files = []
+    for root, dirs, filenames in os.walk(src):
+        if cancel_event and cancel_event.is_set(): return False
+        for filename in filenames:
+            for pattern in patterns:
+                if fnmatch.fnmatch(filename.lower(), pattern.lower()):
+                    files.append(os.path.join(root, filename)); break
+    if not files: return True
+    total = len(files); transferred = 0
+    for file_path in files:
+        if cancel_event and cancel_event.is_set(): return False
         try:
-            if cancel_event is not None and cancel_event.is_set():
-                log("Transfer cancelled by user.")
-                return count
-        except Exception:
-            pass
-        # filtrar directorios excluidos
-        dirs[:] = [d for d in dirs if d not in exclude_dirs]
-        for fn in files:
-            # chequeo de cancelación por archivo
-            try:
-                if cancel_event is not None and cancel_event.is_set():
-                    log("Transfer cancelled by user.")
-                    return count
-            except Exception:
-                pass
-            f = fn.lower()
-            if any(fnmatch.fnmatch(f, pat.lower()) for pat in patterns):
-                src_path = os.path.join(root, fn)
-                target = unique_dest_path(dest, fn)
-                if move:
-                    shutil.move(src_path, target)
-                else:
-                    shutil.copy2(src_path, target)
-                count += 1
-                if progress_cb:
-                    try:
-                        progress_cb(1, fn, kind or "Files")
-                    except Exception:
-                        pass
-                if count % 100 == 0:
-                    log(f"{count} files copied to {dest}")
-    log(f"Copied {count} files to {dest} (flat)")
-    return count
+            rel_path = os.path.relpath(file_path, src)
+            dest_path = os.path.join(dest, rel_path)
+            dest_dir = os.path.dirname(dest_path)
+            os.makedirs(dest_dir, exist_ok=True)
+            if os.path.exists(dest_path): dest_path = unique_dest_path(dest_dir, os.path.basename(dest_path))
+            if move: shutil.move(file_path, dest_path)
+            else: shutil.copy2(file_path, dest_path)
+            transferred += 1
+            if progress_cb and threading.current_thread() is threading.main_thread():
+                progress_cb(transferred, total, kind)
+            elif progress_cb:
+                root_app.after(0, lambda t=transferred, tot=total, k=kind: progress_cb(t, tot, k))
+        except Exception as e:
+            log(f"Error transferring {file_path}: {e}")
+    return True
 
 def do_transfer(src, session_dir, move=False):
-    jpeg_dir = os.path.join(session_dir,"JPEG")
-    raw_dir  = os.path.join(session_dir,"RAW")
-    video_dir= os.path.join(session_dir,"Video")
-
-    # Helpers: contar y actualizar progreso
-    def count_matching_files(src_dir, patterns):
-        import fnmatch
-        total = 0
-        exclude_dirs = {"$RECYCLE.BIN","System Volume Information"}
-        for r, d, files in os.walk(src_dir):
-            d[:] = [x for x in d if x not in exclude_dirs]
-            for fn in files:
-                f = fn.lower()
-                if any(fnmatch.fnmatch(f, pat.lower()) for pat in patterns):
-                    total += 1
-        return total
-
-    def update_progress(pct, kind, filename):
-        import threading
-        text = f"Copying {kind}: {int(pct*100)}% — {filename}"
-        def _ui():
-            try:
-                status_var.set(text)
-            except Exception:
-                pass
-            try:
-                if progress_bar is not None:
-                    if 'USE_CTK' in globals() and USE_CTK:
-                        progress_bar.set(pct)
-                    else:
-                        progress_bar['value'] = int(pct*100)
-            except Exception:
-                pass
-        if threading.current_thread() is threading.main_thread():
-            _ui()
-        else:
-            root_app.after(0, _ui)
-
-    total_jpeg = count_matching_files(src, JPEG_PATTERNS)
-    total_raw  = count_matching_files(src, RAW_PATTERNS)
-    total_video= count_matching_files(src, VIDEO_PATTERNS)
-    total_all = total_jpeg + total_raw + total_video
-    done = {"count": 0}
-
-    update_progress(0.0, "Scanning", "")
-
-    # Solo crear directorios si hay archivos que copiar
-    dirs_to_create = []
-    if total_jpeg > 0:
-        dirs_to_create.append(jpeg_dir)
-    if total_raw > 0:
-        dirs_to_create.append(raw_dir)
-    if total_video > 0:
-        dirs_to_create.append(video_dir)
-    
-    if dirs_to_create:
-        ensure_dirs(*dirs_to_create)
-    
-    # Modo plano: no mantener subcarpetas del origen
-    log("Separating: JPEG, RAW, Video (flat mode)")
-
-    def progress_cb(increment, filename, kind):
-        done["count"] += increment
-        pct = 0.0 if total_all == 0 else done["count"] / total_all
-        update_progress(pct, kind, filename)
-
-    # Detener si se canceló antes de iniciar
-    if cancel_event is not None and cancel_event.is_set():
-        return
-    
-    # Solo transferir si hay archivos del tipo correspondiente
-    if total_jpeg > 0:
-        transfer_with_python(src, jpeg_dir, JPEG_PATTERNS, move=move, progress_cb=progress_cb, kind="JPEG")
-    if cancel_event is not None and cancel_event.is_set():
-        return
-    if total_raw > 0:
-        transfer_with_python(src, raw_dir,  RAW_PATTERNS,  move=move, progress_cb=progress_cb, kind="RAW")
-    if cancel_event is not None and cancel_event.is_set():
-        return
-    if total_video > 0:
-        transfer_with_python(src, video_dir,VIDEO_PATTERNS, move=move, progress_cb=progress_cb, kind="Video")
-
-def organize():
-    global cancel_event, is_transferring, transfer_thread
-    src = src_var.get().strip(); dest = dest_var.get().strip(); move = move_var.get()
-
-    # Si ya está transfiriendo, el mismo botón sirve para cancelar
-    if is_transferring:
-        try:
-            if cancel_event is not None:
-                cancel_event.set()
-            status_var.set("Cancelando...")
-        except Exception:
-            pass
-        log("Cancelling transfer requested by user.")
-        return
-
-    if not dest:
-        messagebox.showerror(APP_NAME, "Select destination folder."); return
-    if not src:
-        messagebox.showerror(APP_NAME, "Select source folder."); return
-
-    session_name = next_sequence_folder(dest); session_dir = os.path.join(dest,session_name)
-    ensure_dirs(session_dir); log(f"Session: {session_dir}")
-
-    # Mientras corre, el botón dice "Cancelar" pero permanece habilitado
-    def set_busy(state: bool):
-        try:
-            if state:
-                organize_btn.configure(text="Cancelar")
-            else:
-                organize_btn.configure(text="Organize")
-        except Exception:
-            pass
-
-    set_busy(True)
-    show_progress()
-
-    # Reset progreso
-    try:
-        status_var.set("Starting...")
-        if progress_bar is not None:
-            if 'USE_CTK' in globals() and USE_CTK:
-                progress_bar.set(0.0)
-            else:
-                progress_bar.configure(value=0)
-    except Exception:
-        pass
-
+    global cancel_event, is_transferring
     import threading
-    cancel_event = threading.Event()
-    is_transferring = True
-
-    def _worker():
-        global cancel_event, is_transferring, transfer_thread
+    cancel_event = threading.Event(); is_transferring = True
+    show_progress()
+    def progress_callback(transferred, total, kind):
+        if total > 0:
+            pct = (transferred / total) * 100
+            progress_bar.set(pct / 100)
+            status_var.set(f"Transferring {kind}: {transferred}/{total} ({pct:.1f}%)")
+    def transfer_task():
         try:
-            do_transfer(src, session_dir, move=move)
-            if cancel_event is not None and cancel_event.is_set():
-                log("Transfer cancelled.")
-                root_app.after(0, status_var.set, "Cancelled")
+            log(f"Starting transfer from {src} to {session_dir}")
+            log(f"Mode: {'Move' if move else 'Copy'}")
+            jpeg_dir = os.path.join(session_dir, "JPEG")
+            raw_dir = os.path.join(session_dir, "RAW")
+            video_dir = os.path.join(session_dir, "VIDEO")
+            ensure_dirs(jpeg_dir, raw_dir, video_dir)
+            # Transfer by categories
+            categories = [("JPEG", JPEG_PATTERNS, jpeg_dir), ("RAW", RAW_PATTERNS, raw_dir), ("VIDEO", VIDEO_PATTERNS, video_dir)]
+            for kind, patterns, dest_dir in categories:
+                if cancel_event.is_set(): break
+                log(f"Transferring {kind} files...")
+                status_var.set(f"Transferring {kind} files...")
+                if robocopy_available() and os.name == 'nt':
+                    success = transfer_with_robocopy(src, dest_dir, patterns, move)
+                else:
+                    success = transfer_with_python(src, dest_dir, patterns, move, progress_callback, kind)
+                if not success and not cancel_event.is_set():
+                    log(f"Failed to transfer {kind} files")
+            if cancel_event.is_set():
+                log("Transfer cancelled by user")
+                status_var.set("Transfer cancelled")
             else:
-                log("Transfer complete.")
-                root_app.after(0, status_var.set, f"Done: {session_dir}")
-                # Completar barra
-                try:
-                    if 'USE_CTK' in globals() and USE_CTK:
-                        root_app.after(0, progress_bar.set, 1.0)
-                    else:
-                        root_app.after(0, progress_bar.configure, {"value":100})
-                except Exception:
-                    pass
-                root_app.after(0, messagebox.showinfo, APP_NAME, "Transfer finished.")
+                log("Transfer completed successfully")
+                status_var.set("Transfer completed")
         except Exception as e:
-            log("Error: "+str(e))
-            root_app.after(0, messagebox.showerror, APP_NAME, f"Error during transfer:\n{e}")
+            log(f"Transfer error: {e}")
+            status_var.set(f"Transfer error: {e}")
         finally:
             is_transferring = False
-            cancel_event = None
-            transfer_thread = None
-            root_app.after(0, set_busy, False)
-            root_app.after(0, hide_progress)
-
-    transfer_thread = threading.Thread(target=_worker, daemon=True)
+            hide_progress()
+    transfer_thread = threading.Thread(target=transfer_task, daemon=True)
     transfer_thread.start()
+
+def organize():
+    global cancel_event, transfer_thread
+    if is_transferring:
+        if messagebox.askyesno("Cancel Transfer", "A transfer is in progress. Cancel it?"):
+            if cancel_event: cancel_event.set()
+            if transfer_thread: transfer_thread.join(timeout=2)
+        return
+    src = src_var.get().strip(); dest = dest_var.get().strip()
+    if not src:
+        messagebox.showerror("Error", "Please select a source folder"); return
+    if not dest:
+        messagebox.showerror("Error", "Please select a destination folder"); return
+    if not os.path.exists(src):
+        messagebox.showerror("Error", f"Source folder does not exist: {src}"); return
+    if not os.path.exists(dest):
+        messagebox.showerror("Error", f"Destination folder does not exist: {dest}"); return
+    session_dir = next_sequence_folder(dest)
+    try: os.makedirs(session_dir, exist_ok=True)
+    except Exception as e:
+        messagebox.showerror("Error", f"Cannot create session folder: {e}"); return
+    move_files = move_var.get()
+    do_transfer(src, session_dir, move_files)
 
 def format_sd():
     src = src_var.get().strip()
-    if not src: messagebox.showerror(APP_NAME, "Select source to detect the SD."); return
+    if not src:
+        messagebox.showerror("Error", "Please select a source folder (SD card)"); return
     drive = detect_drive_letter(src)
-    if not drive: messagebox.showerror(APP_NAME, "SD drive not detected."); return
-    ok = messagebox.askyesno(APP_NAME, f"WARNING: {drive}: will be formatted. Confirm?")
-    if not ok: return
-    ps_cmd = ["powershell","-NoProfile","-Command",f"Format-Volume -DriveLetter {drive} -FileSystem exFAT -Force -Confirm:$false -NewFileSystemLabel 'CAMERA'"]
-    log("Formatting SD: "+" ".join(ps_cmd))
-    p = subprocess.run(ps_cmd, capture_output=True, text=True)
-    if p.returncode != 0:
-        log("STDERR: "+(p.stderr.strip() or ""))
-        messagebox.showerror(APP_NAME, f"Could not format SD.\nExit code: {p.returncode}\n{p.stderr}")
-    else:
-        log(p.stdout.strip() or "Format complete.")
-        messagebox.showinfo(APP_NAME, f"SD {drive}: formatted successfully.")
-# --- Icono de carpeta dibujado ---
+    if not drive:
+        messagebox.showerror("Error", "Cannot detect drive letter. Please select the root of an SD card."); return
+    if not messagebox.askyesno("Confirm Format", f"This will FORMAT drive {drive}: and erase ALL data. Continue?"):
+        return
+    try:
+        cmd = f'format {drive}: /FS:exFAT /Q /V:SD_CARD /Y'
+        result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+        if result.returncode == 0:
+            log(f"Drive {drive}: formatted successfully")
+            messagebox.showinfo("Success", f"Drive {drive}: formatted successfully")
+        else:
+            log(f"Format failed: {result.stderr}")
+            messagebox.showerror("Error", f"Format failed: {result.stderr}")
+    except Exception as e:
+        log(f"Format error: {e}")
+        messagebox.showerror("Error", f"Format error: {e}")
+
 def _make_folder_pil(size=24, color="#e5e7eb"):
-    if Image is None or ImageDraw is None:
-        return None
+    if not Image: return None
     img = Image.new("RGBA", (size, size), (0,0,0,0))
-    d = ImageDraw.Draw(img)
-    # pestaña
-    d.rounded_rectangle([size*0.12, size*0.18, size*0.46, size*0.38], radius=int(size*0.08), fill=color)
-    # cuerpo
-    d.rounded_rectangle([size*0.10, size*0.30, size*0.88, size*0.86], radius=int(size*0.12), fill=color)
+    draw = ImageDraw.Draw(img)
+    margin = size // 8; folder_height = size - 2*margin; folder_width = size - 2*margin
+    tab_width = folder_width // 3; tab_height = folder_height // 4
+    draw.rectangle([margin, margin + tab_height, margin + folder_width, margin + folder_height], fill=color)
+    draw.rectangle([margin, margin, margin + tab_width, margin + tab_height], fill=color)
     return img
 
 def make_ctk_folder_icon(size=20, color="#e5e7eb"):
-    if not ('USE_CTK' in globals() and USE_CTK) or Image is None:
-        return None
-    try:
-        return ctk.CTkImage(light_image=_make_folder_pil(size, color), dark_image=_make_folder_pil(size, color), size=(size, size))
-    except Exception:
-        return None
+    if not ctk or not ImageTk: return None
+    pil_img = _make_folder_pil(size, color)
+    return ctk.CTkImage(light_image=pil_img, dark_image=pil_img, size=(size, size)) if pil_img else None
 
 def make_tk_folder_icon(root, size=16, color="#e5e7eb"):
-    if Image is None or ImageTk is None:
-        return None
-    try:
-        pil = _make_folder_pil(size, color)
-        return ImageTk.PhotoImage(pil)
-    except Exception:
-        return None
+    if not ImageTk: return None
+    pil_img = _make_folder_pil(size, color)
+    return ImageTk.PhotoImage(pil_img) if pil_img else None
 
 def pick_font_family(root):
-    try:
-        fams = set(tkfont.families(root))
-    except Exception:
-        fams = set()
-    for name in ['Roboto', 'Poppins', 'Segoe UI', 'Arial']:
-        if name in fams:
-            return name
-    return 'Arial'
+    global UI_FONT_FAMILY
+    families = sorted(tkfont.families())
+    selection = tk.simpledialog.askstring("Font Selection", f"Available fonts:\n{', '.join(families[:10])}...\n\nEnter font name:", initialvalue=UI_FONT_FAMILY)
+    if selection and selection in families:
+        UI_FONT_FAMILY = selection
+        messagebox.showinfo("Font Changed", f"Font changed to: {UI_FONT_FAMILY}\nRestart the application to apply changes.")
 
 def init_style(root):
-    global UI_FONT_FAMILY, BASE_FONT, TITLE_FONT, SMALL_FONT, LABEL_FONT_BOLD, EMOJI_FONT, ENTRY_FONT
-    UI_FONT_FAMILY = pick_font_family(root)
-    if 'USE_CTK' in globals() and USE_CTK:
-        try:
-            ctk.set_appearance_mode("dark")
-            ctk.set_default_color_theme("blue")
-            BASE_FONT = ctk.CTkFont(family=UI_FONT_FAMILY, size=12)
-            TITLE_FONT = ctk.CTkFont(family=UI_FONT_FAMILY, size=16, weight="bold")
-            SMALL_FONT = ctk.CTkFont(family=UI_FONT_FAMILY, size=11)
-            LABEL_FONT_BOLD = ctk.CTkFont(family=UI_FONT_FAMILY, size=12, weight="bold")
-            # Fuente para emoji visible en Windows
-            EMOJI_FONT = ctk.CTkFont(family="Segoe UI Emoji", size=16)
-            ENTRY_FONT = ctk.CTkFont(family=UI_FONT_FAMILY, size=13)
-        except Exception:
-            pass
-        return
-    # Fallback ttk (sobrio y compacto)
-    style = ttk.Style(root)
+    global BASE_FONT, TITLE_FONT, SMALL_FONT, LABEL_FONT_BOLD, EMOJI_FONT, ENTRY_FONT
     try:
-        style.theme_use('clam')
+        BASE_FONT = tkfont.Font(family=UI_FONT_FAMILY, size=10)
+        TITLE_FONT = tkfont.Font(family=UI_FONT_FAMILY, size=16, weight="bold")
+        SMALL_FONT = tkfont.Font(family=UI_FONT_FAMILY, size=9)
+        LABEL_FONT_BOLD = tkfont.Font(family=UI_FONT_FAMILY, size=10, weight="bold")
+        EMOJI_FONT = tkfont.Font(family="Segoe UI Emoji", size=12)
+        ENTRY_FONT = tkfont.Font(family=UI_FONT_FAMILY, size=10)
     except Exception:
-        pass
-    root.configure(bg='#0f1115')
-    base_bg = '#0f1115'
-    text_fg = '#e5e7eb'
-    style.configure('TFrame', background=base_bg)
-    style.configure('FieldLabel.TLabel', background=base_bg, foreground=text_fg, font=(UI_FONT_FAMILY, 10, 'bold'))
-    style.configure('Muted.TLabel', background=base_bg, foreground='#9ca3af', font=(UI_FONT_FAMILY, 9))
-    style.configure('Modern.TEntry', fieldbackground='#111827', foreground=text_fg, font=(UI_FONT_FAMILY, 11))
-    style.map('Modern.TEntry', fieldbackground=[('focus', '#111827')])
-    style.configure('Compact.TCheckbutton', background=base_bg, foreground=text_fg, font=(UI_FONT_FAMILY, 10))
-    style.configure('Primary.TButton', font=(UI_FONT_FAMILY, 10), padding=6, foreground='#ffffff', background='#2563eb')
-    style.map('Primary.TButton', background=[('active', '#1d4ed8'), ('disabled', '#1e40af')], foreground=[('disabled', '#cbd5e1')])
-    style.configure('Ghost.TButton', font=(UI_FONT_FAMILY, 10), padding=6, foreground=text_fg, background='#334155')
-    style.map('Ghost.TButton', background=[('active', '#475569')])
-    style.configure('Danger.TButton', font=(UI_FONT_FAMILY, 10), padding=6, foreground='#ffffff', background='#ef4444')
-    style.map('Danger.TButton', background=[('active', '#dc2626'), ('disabled', '#b91c1c')], foreground=[('disabled', '#fca5a5')])
-    # Estilo específico para botones de icono con fuente emoji
-    style.configure('IconGhost.TButton', font=('Segoe UI Emoji', 11), padding=6, foreground=text_fg, background='#334155')
-    style.map('IconGhost.TButton', background=[('active', '#475569')])
+        BASE_FONT = tkfont.Font(family="Arial", size=10)
+        TITLE_FONT = tkfont.Font(family="Arial", size=16, weight="bold")
+        SMALL_FONT = tkfont.Font(family="Arial", size=9)
+        LABEL_FONT_BOLD = tkfont.Font(family="Arial", size=10, weight="bold")
+        EMOJI_FONT = tkfont.Font(family="Arial", size=12)
+        ENTRY_FONT = tkfont.Font(family="Arial", size=10)
 
 def toggle_logs():
     global logs_visible
     if logs_visible:
         logs_frame.grid_remove()
-        logs_toggle_btn.configure(text='Show log')
+        logs_toggle_btn.configure(text="Show log")
         logs_visible = False
     else:
         logs_frame.grid()
-        logs_toggle_btn.configure(text='Hide log')
+        logs_toggle_btn.configure(text="Hide log")
         logs_visible = True
 
-# Mostrar/ocultar barra de progreso
 def show_progress():
-    global progress_visible
+    progress_bar.grid()
+    progress_bar.set(0)
+
+def hide_progress():
+    progress_bar.grid_remove()
+    progress_bar.set(0)
+
+def detect_system_theme():
+    """Detecta el tema del sistema Windows"""
     try:
-        if 'USE_CTK' in globals() and USE_CTK:
-            if progress_bar is not None:
-                progress_bar.set(0.0)
-                progress_bar.grid()
+        import winreg
+        registry = winreg.ConnectRegistry(None, winreg.HKEY_CURRENT_USER)
+        key = winreg.OpenKey(registry, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Themes\Personalize")
+        value, _ = winreg.QueryValueEx(key, "AppsUseLightTheme")
+        winreg.CloseKey(key)
+        return "light" if value == 1 else "dark"
+    except:
+        return "light"  # Default fallback
+
+def apply_theme(theme_name):
+    """Aplica el tema y asegura que Settings no se cierre al primer cambio"""
+    if USE_CTK:
+        if theme_name == "system":
+            system_theme = detect_system_theme()
+            ctk.set_appearance_mode(system_theme)
         else:
-            if progress_bar is not None:
-                progress_bar.configure(value=0)
-                progress_bar.grid()
-        progress_visible = True
+            ctk.set_appearance_mode(theme_name)
+    
+    cfg = load_config(); cfg["theme"] = theme_name; save_config(cfg)
+    log(f"Theme changed to: {theme_name}")
+    
+    # Immediate re-elevation if exists
+    try:
+        win = globals().get('CURRENT_SETTINGS_WINDOW')
+        if win is not None:
+            if hasattr(win, 'winfo_exists') and win.winfo_exists():
+                try: win.deiconify()
+                except Exception: pass
+                win.lift(); win.focus_force()
+                try: win.attributes('-topmost', True)
+                except Exception: pass
+                try: win.after(300, lambda: win.attributes('-topmost', False))
+                except Exception: pass
+    except Exception:
+        pass
+    
+    # Safeguard: if destroyed by theme change, reopen with after
+    try:
+        def ensure_settings_visible():
+            try:
+                w = globals().get('CURRENT_SETTINGS_WINDOW')
+                if w is not None and hasattr(w, 'winfo_exists') and w.winfo_exists():
+                    try: w.deiconify()
+                    except Exception: pass
+                    w.lift(); w.focus_force()
+                    try: w.attributes('-topmost', True)
+                    except Exception: pass
+                    try: w.after(300, lambda: w.attributes('-topmost', False))
+                    except Exception: pass
+                else:
+                    # Reopen if destroyed by theme
+                    try: open_settings()
+                    except Exception: pass
+            except Exception:
+                pass
+        if 'root_app' in globals() and globals().get('root_app'):
+            if globals().get('USER_INTENDS_SETTINGS'):
+                globals()['root_app'].after(120, ensure_settings_visible)
+    except Exception:
+        pass
+    
+    # Release any capture in main if stuck
+    try:
+        if 'root_app' in globals() and globals().get('root_app'):
+            globals()['root_app'].grab_release()
+            try: globals()['root_app'].attributes('-topmost', False)
+            except Exception: pass
     except Exception:
         pass
 
-def hide_progress():
-    global progress_visible
-    try:
-        if progress_bar is not None:
-            progress_bar.grid_remove()
-        progress_visible = False
-        # Limpiar estado textual opcionalmente
+def open_settings():
+    """Opens the settings window as a child of main, with sidenav and icon"""
+    global CURRENT_SETTINGS_WINDOW, USER_INTENDS_SETTINGS
+    USER_INTENDS_SETTINGS = True
+    if USE_CTK:
+        settings_window = ctk.CTkToplevel(root_app)
+        CURRENT_SETTINGS_WINDOW = settings_window
+        settings_window.title("Settings")
+        settings_window.resizable(False, False)
+        settings_window.transient(root_app)
+        settings_window.lift()
+        settings_window.focus_force()
+        # Keep on top while open
         try:
-            status_var.set("")
+            settings_window.attributes('-topmost', True)
         except Exception:
             pass
-    except Exception:
-        pass
+        
+        # Icon app
+        try:
+            set_window_icon(settings_window)
+            if os.path.exists(LOGO_ICO_PATH):
+                settings_window.iconbitmap(LOGO_ICO_PATH)
+                settings_window.wm_iconbitmap(LOGO_ICO_PATH)
+        except Exception:
+            pass
+        
+        # Get fonts from styles object
+        styles_obj = apply_styles(settings_window, use_ctk=True)
+        
+        # Center over main
+        width, height = 600, 450
+        try:
+            root_app.update_idletasks()
+            rx, ry = root_app.winfo_rootx(), root_app.winfo_rooty()
+            rw, rh = root_app.winfo_width(), root_app.winfo_height()
+            x = rx + (rw - width)//2
+            y = ry + (rh - height)//2
+            settings_window.geometry(f"{width}x{height}+{x}+{y}")
+        except Exception:
+            settings_window.geometry(f"{width}x{height}")
+        
+        # Improved layout with sidenav
+        settings_window.grid_columnconfigure(0, weight=1)
+        settings_window.grid_rowconfigure(0, weight=1)
+        container = ctk.CTkFrame(settings_window)
+        container.grid(row=0, column=0, sticky="nsew", padx=16, pady=16)
+        container.grid_columnconfigure(0, weight=0)
+        container.grid_columnconfigure(1, weight=1)
+        container.grid_rowconfigure(0, weight=1)
+        
+        # Sidenav with better typography
+        sidenav = ctk.CTkFrame(container, width=160)
+        sidenav.grid(row=0, column=0, sticky="ns", padx=(0,12))
+        
+        # Sidenav header
+        nav_header = ctk.CTkFrame(sidenav, fg_color="transparent")
+        nav_header.pack(fill="x", padx=12, pady=(12,16))
+        ctk.CTkLabel(nav_header, text="Settings", font=styles_obj.TITLE_2_FONT).pack(anchor="w")
+        ctk.CTkLabel(nav_header, text="Configure your preferences", font=styles_obj.CAPTION_1_FONT, text_color="#9ca3af").pack(anchor="w", pady=(2,0))
+        
+        current_section = tk.StringVar(value="Appearance")
+        def select_section(name): current_section.set(name)
+        ctk.CTkButton(sidenav, text="Appearance", command=lambda: select_section("Appearance"), fg_color="#334155", hover_color="#475569", text_color="#e2e8f0", font=styles_obj.CALLOUT_FONT).pack(fill="x", padx=8)
+        
+        # Content area with better design
+        content = ctk.CTkFrame(container, corner_radius=8)
+        content.grid(row=0, column=1, sticky="nsew")
+        content.grid_columnconfigure(0, weight=1)
+        
+        # Improved Appearance section
+        section = ctk.CTkFrame(content, fg_color="transparent")
+        section.grid(row=0, column=0, sticky="nsew", padx=16, pady=16)
+        section.grid_columnconfigure(0, weight=1)
+        
+        # Section header
+        section_header = ctk.CTkFrame(section, fg_color="transparent")
+        section_header.grid(row=0, column=0, sticky="ew", pady=(0,20))
+        ctk.CTkLabel(section_header, text="Appearance", font=styles_obj.TITLE_2_FONT).grid(row=0, column=0, sticky="w")
+        ctk.CTkLabel(section_header, text="Customize the look and feel of the application", font=styles_obj.SUBHEADLINE_FONT, text_color="#9ca3af").grid(row=1, column=0, sticky="w", pady=(4,0))
+        
+        # Theme selection with better design
+        theme_section = ctk.CTkFrame(section, fg_color="transparent")
+        theme_section.grid(row=1, column=0, sticky="ew", pady=(0,16))
+        theme_section.grid_columnconfigure(0, weight=1)
+        
+        ctk.CTkLabel(theme_section, text="Theme", font=styles_obj.HEADLINE_FONT).grid(row=0, column=0, sticky="w", pady=(0,4))
+        ctk.CTkLabel(theme_section, text="Choose between light, dark, or system theme", font=styles_obj.SUBHEADLINE_FONT, text_color="#9ca3af").grid(row=1, column=0, sticky="w", pady=(0,12))
+        
+        current_config = load_config(); current_theme = current_config.get("theme", "system")
+        theme_var = tk.StringVar(value=current_theme)
+        theme_options = ctk.CTkSegmentedButton(theme_section, values=["light","dark","system"], variable=theme_var, command=lambda m: apply_theme(m), font=styles_obj.CALLOUT_FONT)
+        theme_options.grid(row=2, column=0, sticky="w")
+        theme_options.set(current_theme)
+        
+        def close_settings():
+            try: settings_window.destroy()
+            except Exception: pass
+            globals()['CURRENT_SETTINGS_WINDOW'] = None
+            globals()['USER_INTENDS_SETTINGS'] = False
+        
+        settings_window.protocol("WM_DELETE_WINDOW", close_settings)
+        
+        # Improved close button
+        button_frame = ctk.CTkFrame(content, fg_color="transparent")
+        button_frame.grid(row=1, column=0, sticky="ew", padx=16, pady=(0,16))
+        button_frame.grid_columnconfigure(0, weight=1)
+        ctk.CTkButton(button_frame, text="Close", command=close_settings, fg_color="#6b7280", hover_color="#4b5563", font=styles_obj.CALLOUT_FONT, height=36).grid(row=0, column=0, sticky="e")
+    else:
+        settings_window = tk.Toplevel(root_app)
+        CURRENT_SETTINGS_WINDOW = settings_window
+        settings_window.title("Settings")
+        settings_window.resizable(False, False)
+        settings_window.transient(root_app)
+        settings_window.lift()
+        settings_window.focus_force()
+        try:
+            settings_window.attributes('-topmost', True)
+        except Exception:
+            pass
+        try:
+            if os.path.exists(LOGO_ICO_PATH):
+                settings_window.iconbitmap(LOGO_ICO_PATH)
+                settings_window.wm_iconbitmap(LOGO_ICO_PATH)
+        except Exception:
+            pass
+        width, height = 600, 420
+        try:
+            root_app.update_idletasks()
+            rx, ry = root_app.winfo_rootx(), root_app.winfo_rooty()
+            rw, rh = root_app.winfo_width(), root_app.winfo_height()
+            x = rx + (rw - width)//2
+            y = ry + (rh - height)//2
+            settings_window.geometry(f"{width}x{height}+{x}+{y}")
+        except Exception:
+            settings_window.geometry(f"{width}x{height}")
+        
+        container = ttk.Frame(settings_window, padding=16)
+        container.pack(fill="both", expand=True)
+        left = ttk.Frame(container, width=160)
+        left.pack(side="left", fill="y", padx=(0,12))
+        ttk.Label(left, text="Settings", font=TITLE_FONT).pack(anchor="w", padx=8, pady=(6,12))
+        ttk.Button(left, text="Appearance").pack(fill="x")
+        
+        right = ttk.Frame(container)
+        right.pack(side="left", fill="both", expand=True)
+        
+        appearance = ttk.LabelFrame(right, text="Appearance", padding=12)
+        appearance.pack(fill="x")
+        ttk.Label(appearance, text="Theme:").pack(anchor="w", pady=(0,5))
+        
+        current_config = load_config(); current_theme = current_config.get("theme", "system")
+        theme_var = tk.StringVar(value=current_theme)
+        def on_theme_change(): apply_theme(theme_var.get())
+        radios = ttk.Frame(appearance); radios.pack(anchor="w", pady=(0,10))
+        ttk.Radiobutton(radios, text="Light", variable=theme_var, value="light", command=on_theme_change).pack(anchor="w")
+        ttk.Radiobutton(radios, text="Dark", variable=theme_var, value="dark", command=on_theme_change).pack(anchor="w")
+        ttk.Radiobutton(radios, text="System", variable=theme_var, value="system", command=on_theme_change).pack(anchor="w")
+        
+        def close_settings():
+            try: settings_window.destroy()
+            except Exception: pass
+            globals()['CURRENT_SETTINGS_WINDOW'] = None
+            globals()['USER_INTENDS_SETTINGS'] = False
+        
+        settings_window.protocol("WM_DELETE_WINDOW", close_settings)
+        ttk.Button(right, text="Close", command=close_settings).pack(anchor="e", pady=(12,0))
 
 def build_gui():
     global dest_var, src_var, move_var, status_var, root_app, organize_btn, format_btn, log_text, logs_frame, logs_toggle_btn, logs_visible, progress_bar
@@ -523,101 +586,143 @@ def build_gui():
         root = ctk.CTk(); root.title("")
         set_window_icon(root)
         styles_obj = apply_styles(root, use_ctk=True)
-        # Fuentes locales tomadas del módulo de estilos
+        
+        # New Apple-style typographic hierarchy
+        LARGE_TITLE_FONT = styles_obj.LARGE_TITLE_FONT
+        TITLE_1_FONT = styles_obj.TITLE_1_FONT
+        TITLE_2_FONT = styles_obj.TITLE_2_FONT
+        TITLE_3_FONT = styles_obj.TITLE_3_FONT
+        HEADLINE_FONT = styles_obj.HEADLINE_FONT
+        BODY_FONT = styles_obj.BODY_FONT
+        CALLOUT_FONT = styles_obj.CALLOUT_FONT
+        SUBHEADLINE_FONT = styles_obj.SUBHEADLINE_FONT
+        FOOTNOTE_FONT = styles_obj.FOOTNOTE_FONT
+        CAPTION_1_FONT = styles_obj.CAPTION_1_FONT
+        MONOSPACE_FONT = styles_obj.MONOSPACE_FONT
+        EMOJI_FONT = styles_obj.EMOJI_FONT
+        
+        # Compatibility with existing code
         TITLE_FONT = styles_obj.TITLE_FONT
         SMALL_FONT = styles_obj.SMALL_FONT
         LABEL_FONT_BOLD = styles_obj.LABEL_FONT_BOLD
         BASE_FONT = styles_obj.BASE_FONT
-        EMOJI_FONT = styles_obj.EMOJI_FONT
         ENTRY_FONT = styles_obj.ENTRY_FONT
+        
         root_app = root
         dest_var = tk.StringVar(root)
         src_var = tk.StringVar(root)
         move_var = tk.BooleanVar(root, value=False)
         status_var = tk.StringVar(root, value="")
         root.grid_columnconfigure(0, weight=1); root.grid_rowconfigure(1, weight=1)
-        # Header
-        header = ctk.CTkFrame(root, corner_radius=0, height=40)
+        
+        # Header with improved design
+        header = ctk.CTkFrame(root, corner_radius=0, height=50)
         header.grid(row=0, column=0, sticky="ew")
         header.grid_columnconfigure(1, weight=1)
 
-        # Title
-        title_label = ctk.CTkLabel(header, text="Archivium", font=TITLE_FONT)
-        title_label.grid(row=0, column=0, sticky="w", padx=20, pady=10)
+        # Title con fuente más prominente
+        title_label = ctk.CTkLabel(header, text="Archivium", font=TITLE_1_FONT)
+        title_label.grid(row=0, column=0, sticky="w", padx=20, pady=12)
 
-        # Theme switcher
-        theme_switcher_frame = ctk.CTkFrame(header, fg_color="transparent")
-        theme_switcher_frame.grid(row=0, column=1, sticky="e", padx=10, pady=10)
-
-        def set_appearance_mode(mode):
-            ctk.set_appearance_mode(mode)
-
-        theme_switcher = ctk.CTkSegmentedButton(
-            theme_switcher_frame,
-            values=["Light", "Dark"],
-            command=set_appearance_mode,
-            font=SMALL_FONT,
-            height=28,
-            selected_color="#334155",
-            selected_hover_color="#475569"
+        # Settings button
+        settings_btn = ctk.CTkButton(
+            header, 
+            text="⚙️", 
+            font=EMOJI_FONT, 
+            command=open_settings,
+            fg_color="#6b7280",
+            hover_color="#4b5563",
+            width=40,
+            height=30
         )
-        theme_switcher.set(ctk.get_appearance_mode())
-        theme_switcher.pack()
+        settings_btn.grid(row=0, column=1, sticky="e", padx=20, pady=12)
+        
         # Main content area
         main_frame = ctk.CTkFrame(root, corner_radius=12)
         main_frame.grid(row=1, column=0, sticky="nsew", padx=12, pady=(6,12))
         main_frame.grid_columnconfigure(0, weight=1)
+        
         # Config frame
         config_frame = ctk.CTkFrame(main_frame, fg_color="transparent")
         config_frame.grid(row=0, column=0, sticky="ew", padx=15, pady=15)
         config_frame.grid_columnconfigure(1, weight=1)
-        # Fila destino
-        ctk.CTkLabel(config_frame, text="Destination (default):", font=LABEL_FONT_BOLD).grid(row=0, column=0, columnspan=3, sticky="w", padx=12, pady=(12,4))
+        
+        # Destination folder selection
+        ctk.CTkLabel(config_frame, text="Destination", font=HEADLINE_FONT).grid(row=0, column=0, columnspan=3, sticky="w", padx=12, pady=(12,2))
+        ctk.CTkLabel(config_frame, text="Choose your default output folder", font=SUBHEADLINE_FONT, text_color="#9ca3af").grid(row=1, column=0, columnspan=3, sticky="w", padx=12, pady=(0,8))
+        
         dest_row = ctk.CTkFrame(config_frame)
-        dest_row.grid(row=1, column=0, columnspan=3, sticky="ew", padx=12, pady=(0,12))
+        dest_row.grid(row=2, column=0, columnspan=3, sticky="ew", padx=12, pady=(0,16))
         dest_row.grid_columnconfigure(0, weight=1)
         dest_row.grid_columnconfigure(1, weight=0)
-        dest_entry = ctk.CTkEntry(dest_row, textvariable=dest_var, font=ENTRY_FONT, height=34)
-        dest_entry.grid(row=0, column=0, sticky="ew", padx=(0,6))
-        btn_dest = ctk.CTkButton(dest_row, text="📁", font=EMOJI_FONT, corner_radius=6, command=pick_dest, fg_color="#1f2937", hover_color="#374151", text_color="#e2e8f0", width=48, height=34)
+        dest_entry = ctk.CTkEntry(dest_row, textvariable=dest_var, font=BODY_FONT, height=36)
+        dest_entry.grid(row=0, column=0, sticky="ew", padx=(0,8))
+        btn_dest = ctk.CTkButton(dest_row, text="📁", font=EMOJI_FONT, corner_radius=6, command=pick_dest, fg_color="#1f2937", hover_color="#374151", text_color="#e2e8f0", width=48, height=36)
         btn_dest.grid(row=0, column=1, sticky="e")
-        # Fila origen
-        ctk.CTkLabel(config_frame, text="Source (SD/Folder):", font=LABEL_FONT_BOLD).grid(row=2, column=0, columnspan=3, sticky="w", padx=12, pady=(0,4))
+        
+        # Source folder selection
+        ctk.CTkLabel(config_frame, text="Source", font=HEADLINE_FONT).grid(row=3, column=0, columnspan=3, sticky="w", padx=12, pady=(0,2))
+        ctk.CTkLabel(config_frame, text="Select SD card or folder to organize", font=SUBHEADLINE_FONT, text_color="#9ca3af").grid(row=4, column=0, columnspan=3, sticky="w", padx=12, pady=(0,8))
+        
         src_row = ctk.CTkFrame(config_frame)
-        src_row.grid(row=3, column=0, columnspan=3, sticky="ew", padx=12, pady=(0,12))
+        src_row.grid(row=5, column=0, columnspan=3, sticky="ew", padx=12, pady=(0,16))
         src_row.grid_columnconfigure(0, weight=1)
         src_row.grid_columnconfigure(1, weight=0)
-        src_entry = ctk.CTkEntry(src_row, textvariable=src_var, font=ENTRY_FONT, height=34)
-        src_entry.grid(row=0, column=0, sticky="ew", padx=(0,6))
-        btn_src = ctk.CTkButton(src_row, text="📁", font=EMOJI_FONT, corner_radius=6, command=pick_src, fg_color="#1f2937", hover_color="#374151", text_color="#e2e8f0", width=48, height=34)
+        src_entry = ctk.CTkEntry(src_row, textvariable=src_var, font=BODY_FONT, height=36)
+        src_entry.grid(row=0, column=0, sticky="ew", padx=(0,8))
+        btn_src = ctk.CTkButton(src_row, text="📁", font=EMOJI_FONT, corner_radius=6, command=pick_src, fg_color="#1f2937", hover_color="#374151", text_color="#e2e8f0", width=48, height=36)
         btn_src.grid(row=0, column=1, sticky="e")
-        # Switch mover
-        move_switch = ctk.CTkSwitch(config_frame, text="Move instead of copy (deletes from source)", variable=move_var, onvalue=True, offvalue=False, font=BASE_FONT)
-        move_switch.grid(row=4, column=0, columnspan=3, sticky="w", padx=12, pady=(0,12))
-        # Botones
-        logs_toggle_btn = ctk.CTkButton(config_frame, text="Show log", command=toggle_logs, fg_color="#334155", hover_color="#475569", text_color="#e2e8f0", font=BASE_FONT)
-        logs_toggle_btn.grid(row=5, column=0, sticky="w", padx=12, pady=(0,12))
-        organize_btn = ctk.CTkButton(config_frame, text="Organize", command=organize, fg_color="#2563eb", hover_color="#1d4ed8", text_color="#ffffff", font=BASE_FONT)
-        organize_btn.grid(row=5, column=1, sticky="w", padx=(0,12), pady=(0,12))
-        # Format button removed
-        # Estado y progreso
-        ctk.CTkLabel(main_frame, textvariable=status_var, font=BASE_FONT).grid(row=1, column=0, columnspan=3, sticky="ew", padx=12, pady=(0,4))
-        progress_bar = ctk.CTkProgressBar(main_frame)
+        
+        # Switch mover con mejor tipografía
+        move_switch = ctk.CTkSwitch(config_frame, text="Move instead of copy", variable=move_var, onvalue=True, offvalue=False, font=CALLOUT_FONT)
+        move_switch.grid(row=6, column=0, columnspan=3, sticky="w", padx=12, pady=(0,4))
+        ctk.CTkLabel(config_frame, text="Files will be deleted from source location", font=FOOTNOTE_FONT, text_color="#9ca3af").grid(row=7, column=0, columnspan=3, sticky="w", padx=12, pady=(0,16))
+        
+        # Buttons frame
+        button_frame = ctk.CTkFrame(config_frame, fg_color="transparent")
+        button_frame.grid(row=8, column=0, columnspan=3, sticky="ew", padx=12, pady=(0,12))
+        button_frame.grid_columnconfigure(0, weight=0)
+        button_frame.grid_columnconfigure(1, weight=0)
+        button_frame.grid_columnconfigure(2, weight=1)
+        
+        logs_toggle_btn = ctk.CTkButton(button_frame, text="Show Log", command=toggle_logs, fg_color="#334155", hover_color="#475569", text_color="#e2e8f0", font=CALLOUT_FONT, height=36)
+        logs_toggle_btn.grid(row=0, column=0, sticky="w", padx=(0,12))
+        
+        organize_btn = ctk.CTkButton(button_frame, text="Organize Files", command=organize, fg_color="#2563eb", hover_color="#1d4ed8", text_color="#ffffff", font=CALLOUT_FONT, height=36)
+        organize_btn.grid(row=0, column=1, sticky="w")
+        
+        # Status and progress frame
+        status_frame = ctk.CTkFrame(main_frame, fg_color="transparent")
+        status_frame.grid(row=1, column=0, columnspan=3, sticky="ew", padx=12, pady=(0,4))
+        ctk.CTkLabel(status_frame, textvariable=status_var, font=SUBHEADLINE_FONT).grid(row=0, column=0, sticky="w")
+        
+        progress_bar = ctk.CTkProgressBar(main_frame, height=6)
         progress_bar.grid(row=2, column=0, columnspan=3, sticky="ew", padx=12, pady=(0,12))
         progress_bar.set(0)
         progress_bar.grid_remove()
-        # Registro
+        
+        # Logs frame
         logs_frame = ctk.CTkFrame(main_frame, corner_radius=8)
         logs_frame.grid(row=3, column=0, columnspan=3, sticky="nsew", padx=12, pady=(6,0))
-        ctk.CTkLabel(logs_frame, text="Log:", font=LABEL_FONT_BOLD).grid(row=0, column=0, sticky="nw", padx=8, pady=(8,4))
-        log_text = ctk.CTkTextbox(logs_frame, width=560, height=180, font=BASE_FONT)
+        
+        log_header = ctk.CTkFrame(logs_frame, fg_color="transparent")
+        log_header.grid(row=0, column=0, sticky="ew", padx=8, pady=(8,4))
+        ctk.CTkLabel(log_header, text="Activity Log", font=TITLE_3_FONT).grid(row=0, column=0, sticky="w")
+        ctk.CTkLabel(log_header, text="Real-time transfer progress and details", font=CAPTION_1_FONT, text_color="#9ca3af").grid(row=1, column=0, sticky="w", pady=(2,0))
+        
+        log_text = ctk.CTkTextbox(logs_frame, width=560, height=180, font=MONOSPACE_FONT)
         log_text.grid(row=1, column=0, sticky="nsew", padx=8, pady=(0,8))
         logs_frame.grid_columnconfigure(0, weight=1); logs_frame.grid_rowconfigure(1, weight=1)
-        # Colapsar por defecto
+        # Collapse by default
         logs_visible = False
         logs_frame.grid_remove()
         main_frame.grid_rowconfigure(3, weight=1)
-        cfg = load_config();
+        
+        # Apply saved theme
+        cfg = load_config()
+        saved_theme = cfg.get("theme", "system")
+        apply_theme(saved_theme)
+        
         if cfg.get("default_dest"): dest_var.set(cfg["default_dest"]) 
         return root
     else:
@@ -629,9 +734,24 @@ def build_gui():
         src_var = tk.StringVar(root)
         move_var = tk.BooleanVar(root, value=False)
         status_var = tk.StringVar(root, value="")
-        frm = ttk.Frame(root, padding=10); frm.grid(row=0,column=0,sticky="nsew")
-        root.columnconfigure(0, weight=1); root.rowconfigure(0, weight=1)
-        # Col 0 expandible; col 1 ancho fijo (botón)
+        
+        # Main container frame
+        main_container = ttk.Frame(root)
+        main_container.pack(fill="both", expand=True)
+        
+        # Header frame
+        header_frame = ttk.Frame(main_container)
+        header_frame.pack(fill="x", padx=10, pady=(10, 0))
+        
+        # Title label
+        title_label = ttk.Label(header_frame, text="Archivium", font=("Arial", 16, "bold"))
+        title_label.pack(side="left")
+        
+        # Settings button
+        settings_btn = ttk.Button(header_frame, text="⚙️", command=open_settings, width=3)
+        settings_btn.pack(side="right")
+        
+        frm = ttk.Frame(main_container, padding=10); frm.pack(fill="both", expand=True)
         frm.columnconfigure(0, weight=1)
         frm.columnconfigure(1, weight=0)
         ttk.Label(frm,text="Destination (default):", style='FieldLabel.TLabel').grid(row=0,column=0,columnspan=3,sticky="w")
@@ -648,17 +768,16 @@ def build_gui():
         ttk.Button(src_row,text="📁",width=3,command=pick_src, style='IconGhost.TButton').grid(row=0,column=1,sticky="e", padx=(6,0))
         # Switch mover
         ttk.Checkbutton(frm,text="Move instead of copy (deletes from source)",variable=move_var, style='Compact.TCheckbutton').grid(row=4,column=0,columnspan=2,sticky="w",pady=(4,8))
-        # Botones
+        # Log toggle button
         logs_toggle_btn = ttk.Button(frm,text="Show log",command=toggle_logs, style='Ghost.TButton')
         logs_toggle_btn.grid(row=5,column=0,sticky="w")
         organize_btn = ttk.Button(frm,text="Organize",command=organize, style='Primary.TButton'); organize_btn.grid(row=5,column=1,sticky="w")
-        # Format button removed (ttk)
-        # Estado y progreso
+
+        # Status label
         ttk.Label(frm,textvariable=status_var, style='FieldLabel.TLabel').grid(row=6,column=0,columnspan=3,sticky="w",pady=(4,4))
         progress_bar = ttk.Progressbar(frm, maximum=100, mode="determinate")
         progress_bar.grid(row=7,column=0,columnspan=3,sticky="ew",pady=(0,8))
         progress_bar.configure(value=0)
-        # Frame de registro (colapsable)
         logs_frame = ttk.Frame(frm)
         logs_frame.grid(row=8,column=0,columnspan=3,sticky="nsew",pady=(6,0))
         ttk.Label(logs_frame,text="Log:", style='FieldLabel.TLabel').grid(row=0,column=0,sticky="nw")
@@ -673,6 +792,7 @@ def build_gui():
         cfg = load_config();
         if cfg.get("default_dest"): dest_var.set(cfg["default_dest"]) 
         return root
+
 if __name__ == "__main__":
     app = build_gui()
     app.mainloop()
