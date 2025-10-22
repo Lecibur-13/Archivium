@@ -23,7 +23,7 @@ APP_NAME = "Archivium"
 APP_ID = "Archivium"
 APPDATA_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), APP_ID)
 CONFIG_PATH = os.path.join(APPDATA_DIR, "config.json")
-DEFAULT_CONFIG = {"default_dest": "", "theme": "system"}
+DEFAULT_CONFIG = {"default_dest": "", "theme": "system", "organize_mode": "current"}
 # App logo paths
 LOGO_PATH = os.path.join(os.path.dirname(__file__), "img", "logo.PNG")
 LOGO_ICO_PATH = os.path.join(os.path.dirname(__file__), "img", "logo.ico")
@@ -153,6 +153,90 @@ def unique_dest_path(dest, filename):
         filename = f"{base}_{counter}{ext}"; counter += 1
     return os.path.join(dest, filename)
 
+# Determina el tipo de archivo a partir de su extensión
+def get_file_type(file_path):
+    ext = os.path.splitext(file_path)[1].lower()
+    jpeg_exts = {".jpg",".jpeg",".jpe",".jfif",".png",".gif",".bmp",".tiff",".tif",".webp",".ico",".svg",".heic",".heif"}
+    raw_exts = {".cr2",".cr3",".nef",".raf",".arw",".rw2",".dng",".orf",".sr2",".pef",".nrw"}
+    video_exts = {".mp4",".mov",".avi",".mts",".mxf",".mpg",".mpeg",".mkv",".wmv",".3gp"}
+    if ext in jpeg_exts: return "JPEG"
+    if ext in raw_exts: return "RAW"
+    if ext in video_exts: return "VIDEO"
+    return None
+
+# Obtiene la fecha de captura (EXIF si disponible; si no, fecha de modificación)
+def get_capture_date(file_path):
+    # Devuelve formato DD-MM-YYYY
+    try:
+        if Image:
+            try:
+                img = Image.open(file_path)
+                exif = {}
+                try:
+                    exif = img.getexif() or {}
+                except Exception:
+                    pass
+                # Intentar claves string y numéricas más comunes
+                dt = None
+                if isinstance(exif, dict):
+                    dt = exif.get("DateTimeOriginal") or exif.get("DateTime") or exif.get("DateTimeDigitized")
+                    dt = dt or exif.get(36867) or exif.get(306) or exif.get(36868)
+                if dt:
+                    # Formato típico: YYYY:MM:DD HH:MM:SS
+                    import datetime as _dt
+                    s = str(dt)
+                    parts = s.split(" ")[0].replace(":","-").split("-")
+                    if len(parts) >= 3:
+                        yyyy, mm, dd = parts[0], parts[1], parts[2]
+                        return f"{dd}-{mm}-{yyyy}"
+                try:
+                    img.close()
+                except Exception:
+                    pass
+            except Exception:
+                pass
+        ts = os.path.getmtime(file_path)
+        d = datetime.datetime.fromtimestamp(ts).date()
+        return d.strftime("%d-%m-%Y")
+    except Exception:
+        return datetime.date.today().strftime("%d-%m-%Y")
+
+# Transfiere agrupando por fecha→tipo o tipo→fecha
+def transfer_grouped(src, dest, move=False, progress_cb=None, mode="date_then_type"):
+    import shutil, threading
+    global cancel_event
+    files_info = []
+    for root, dirs, filenames in os.walk(src):
+        if cancel_event and cancel_event.is_set(): return False
+        for filename in filenames:
+            fp = os.path.join(root, filename)
+            typ = get_file_type(fp)
+            if not typ: continue
+            date_str = get_capture_date(fp)
+            files_info.append((fp, typ, date_str))
+    total = len(files_info); transferred = 0
+    for fp, typ, date_str in files_info:
+        if cancel_event and cancel_event.is_set(): return False
+        try:
+            if mode == "date_then_type":
+                dest_dir = os.path.join(dest, date_str, typ)
+            else:
+                dest_dir = os.path.join(dest, typ, date_str)
+            os.makedirs(dest_dir, exist_ok=True)
+            out_name = os.path.basename(fp)
+            dest_path = os.path.join(dest_dir, out_name)
+            if os.path.exists(dest_path): dest_path = unique_dest_path(dest_dir, out_name)
+            if move: shutil.move(fp, dest_path)
+            else: shutil.copy2(fp, dest_path)
+            transferred += 1
+            if progress_cb and threading.current_thread() is threading.main_thread():
+                progress_cb(transferred, total, typ)
+            elif progress_cb:
+                root_app.after(0, lambda t=transferred, tot=total, k=typ: progress_cb(t, tot, k))
+        except Exception as e:
+            log(f"Error transferring {fp}: {e}")
+    return True
+
 def transfer_with_python(src, dest, patterns, move=False, progress_cb=None, kind=None):
     import shutil, fnmatch, threading
     global cancel_event
@@ -186,7 +270,7 @@ def transfer_with_python(src, dest, patterns, move=False, progress_cb=None, kind
     return True
 
 def do_transfer(src, session_dir, move=False):
-    global cancel_event, is_transferring
+    global cancel_event, is_transferring, transfer_thread
     import threading
     cancel_event = threading.Event(); is_transferring = True
     show_progress()
@@ -199,22 +283,32 @@ def do_transfer(src, session_dir, move=False):
         try:
             log(f"Starting transfer from {src} to {session_dir}")
             log(f"Mode: {'Move' if move else 'Copy'}")
-            jpeg_dir = os.path.join(session_dir, "JPEG")
-            raw_dir = os.path.join(session_dir, "RAW")
-            video_dir = os.path.join(session_dir, "VIDEO")
-            ensure_dirs(jpeg_dir, raw_dir, video_dir)
-            # Transfer by categories
-            categories = [("JPEG", JPEG_PATTERNS, jpeg_dir), ("RAW", RAW_PATTERNS, raw_dir), ("VIDEO", VIDEO_PATTERNS, video_dir)]
-            for kind, patterns, dest_dir in categories:
-                if cancel_event.is_set(): break
-                log(f"Transferring {kind} files...")
-                status_var.set(f"Transferring {kind} files...")
-                if robocopy_available() and os.name == 'nt':
-                    success = transfer_with_robocopy(src, dest_dir, patterns, move)
-                else:
-                    success = transfer_with_python(src, dest_dir, patterns, move, progress_callback, kind)
+            cfg = load_config(); mode = cfg.get("organize_mode", "current")
+            if mode == "current":
+                jpeg_dir = os.path.join(session_dir, "JPEG")
+                raw_dir = os.path.join(session_dir, "RAW")
+                video_dir = os.path.join(session_dir, "VIDEO")
+                ensure_dirs(jpeg_dir, raw_dir, video_dir)
+                # Transfer by categories
+                categories = [("JPEG", JPEG_PATTERNS, jpeg_dir), ("RAW", RAW_PATTERNS, raw_dir), ("VIDEO", VIDEO_PATTERNS, video_dir)]
+                for kind, patterns, dest_dir in categories:
+                    if cancel_event.is_set(): break
+                    log(f"Transferring {kind} files...")
+                    status_var.set(f"Transferring {kind} files...")
+                    if robocopy_available() and os.name == 'nt':
+                        success = transfer_with_robocopy(src, dest_dir, patterns, move)
+                    else:
+                        success = transfer_with_python(src, dest_dir, patterns, move, progress_callback, kind)
+                    if not success and not cancel_event.is_set():
+                        log(f"Failed to transfer {kind} files")
+            else:
+                log(f"Transfiriendo en modo '{mode}'...")
+                status_var.set("Transferring grouped files...")
+                # Para modos avanzados se usa transferencia Python agrupada
+                m = "date_then_type" if mode == "date_then_type" else "type_then_date"
+                success = transfer_grouped(src, session_dir, move, progress_callback, mode=m)
                 if not success and not cancel_event.is_set():
-                    log(f"Failed to transfer {kind} files")
+                    log("Failed to transfer grouped files")
             if cancel_event.is_set():
                 log("Transfer cancelled by user")
                 status_var.set("Transfer cancelled")
@@ -231,7 +325,15 @@ def do_transfer(src, session_dir, move=False):
     transfer_thread.start()
 
 def organize():
-    global cancel_event, transfer_thread
+    global cancel_event, transfer_thread, is_transferring
+    # Robustez: si el hilo terminó pero la bandera quedó activa, resetea
+    try:
+        if is_transferring and transfer_thread and not transfer_thread.is_alive():
+            is_transferring = False
+            try: hide_progress()
+            except Exception: pass
+    except Exception:
+        pass
     if is_transferring:
         if messagebox.askyesno("Cancel Transfer", "A transfer is in progress. Cancel it?"):
             if cancel_event: cancel_event.set()
@@ -246,12 +348,17 @@ def organize():
         messagebox.showerror("Error", f"Source folder does not exist: {src}"); return
     if not os.path.exists(dest):
         messagebox.showerror("Error", f"Destination folder does not exist: {dest}"); return
-    session_dir = next_sequence_folder(dest)
-    try: os.makedirs(session_dir, exist_ok=True)
-    except Exception as e:
-        messagebox.showerror("Error", f"Cannot create session folder: {e}"); return
+    cfg = load_config(); mode = cfg.get("organize_mode", "current")
+    if mode == "current":
+        session_dir = next_sequence_folder(dest)
+        try: os.makedirs(session_dir, exist_ok=True)
+        except Exception as e:
+            messagebox.showerror("Error", f"Cannot create session folder: {e}"); return
+        out_base = session_dir
+    else:
+        out_base = dest
     move_files = move_var.get()
-    do_transfer(src, session_dir, move_files)
+    do_transfer(src, out_base, move_files)
 
 def format_sd():
     src = src_var.get().strip()
@@ -412,6 +519,14 @@ def apply_theme(theme_name):
     except Exception:
         pass
 
+# Guarda el modo de organización de carpetas seleccionado
+def apply_organize_mode(mode_name):
+    try:
+        cfg = load_config(); cfg["organize_mode"] = mode_name; save_config(cfg)
+        log(f"Modo de organización actualizado: {mode_name}")
+    except Exception as e:
+        log(f"No se pudo guardar el modo de organización: {e}")
+
 def open_settings():
     """Opens the settings window as a child of main, with sidenav and icon"""
     global CURRENT_SETTINGS_WINDOW, USER_INTENDS_SETTINGS
@@ -474,45 +589,81 @@ def open_settings():
         ctk.CTkLabel(nav_header, text="Configure your preferences", font=styles_obj.CAPTION_1_FONT, text_color="#9ca3af").pack(anchor="w", pady=(2,0))
         
         current_section = tk.StringVar(value="Appearance")
-        def select_section(name): current_section.set(name)
-        ctk.CTkButton(sidenav, text="Appearance", command=lambda: select_section("Appearance"), fg_color="#334155", hover_color="#475569", text_color="#e2e8f0", font=styles_obj.CALLOUT_FONT).pack(fill="x", padx=8)
+        def update_section_view():
+            try:
+                if current_section.get() == "Appearance":
+                    appearance_section.grid()
+                    behavior_section.grid_remove()
+                else:
+                    behavior_section.grid()
+                    appearance_section.grid_remove()
+            except Exception:
+                pass
+        def select_section(name):
+            current_section.set(name)
+            update_section_view()
+        ctk.CTkButton(sidenav, text="Appearance", command=lambda: select_section("Appearance"), fg_color="#334155", hover_color="#475569", text_color="#e2e8f0", font=styles_obj.CALLOUT_FONT).pack(fill="x", padx=8, pady=(0,6))
+        ctk.CTkButton(sidenav, text="Behavior", command=lambda: select_section("Behavior"), fg_color="#334155", hover_color="#475569", text_color="#e2e8f0", font=styles_obj.CALLOUT_FONT).pack(fill="x", padx=8)
         
         # Content area with better design
         content = ctk.CTkFrame(container, corner_radius=8)
         content.grid(row=0, column=1, sticky="nsew")
         content.grid_columnconfigure(0, weight=1)
         
-        # Improved Appearance section
-        section = ctk.CTkFrame(content, fg_color="transparent")
-        section.grid(row=0, column=0, sticky="nsew", padx=16, pady=16)
-        section.grid_columnconfigure(0, weight=1)
+        # Appearance section (separate frame)
+        appearance_section = ctk.CTkFrame(content, fg_color="transparent")
+        appearance_section.grid(row=0, column=0, sticky="nsew", padx=16, pady=16)
+        appearance_section.grid_columnconfigure(0, weight=1)
         
         # Section header
-        section_header = ctk.CTkFrame(section, fg_color="transparent")
+        section_header = ctk.CTkFrame(appearance_section, fg_color="transparent")
         section_header.grid(row=0, column=0, sticky="ew", pady=(0,20))
         ctk.CTkLabel(section_header, text="Appearance", font=styles_obj.TITLE_2_FONT).grid(row=0, column=0, sticky="w")
         ctk.CTkLabel(section_header, text="Customize the look and feel of the application", font=styles_obj.SUBHEADLINE_FONT, text_color="#9ca3af").grid(row=1, column=0, sticky="w", pady=(4,0))
         
-        # Theme selection with better design
-        theme_section = ctk.CTkFrame(section, fg_color="transparent")
+        # Theme selection
+        theme_section = ctk.CTkFrame(appearance_section, fg_color="transparent")
         theme_section.grid(row=1, column=0, sticky="ew", pady=(0,16))
         theme_section.grid_columnconfigure(0, weight=1)
-        
         ctk.CTkLabel(theme_section, text="Theme", font=styles_obj.HEADLINE_FONT).grid(row=0, column=0, sticky="w", pady=(0,4))
         ctk.CTkLabel(theme_section, text="Choose between light, dark, or system theme", font=styles_obj.SUBHEADLINE_FONT, text_color="#9ca3af").grid(row=1, column=0, sticky="w", pady=(0,12))
-        
         current_config = load_config(); current_theme = current_config.get("theme", "system")
         theme_var = tk.StringVar(value=current_theme)
         theme_options = ctk.CTkSegmentedButton(theme_section, values=["light","dark","system"], variable=theme_var, command=lambda m: apply_theme(m), font=styles_obj.CALLOUT_FONT)
         theme_options.grid(row=2, column=0, sticky="w")
         theme_options.set(current_theme)
         
+        # Behavior section (separate frame)
+        behavior_section = ctk.CTkFrame(content, fg_color="transparent")
+        behavior_section.grid(row=0, column=0, sticky="nsew", padx=16, pady=16)
+        behavior_section.grid_columnconfigure(0, weight=1)
+        behavior_header = ctk.CTkFrame(behavior_section, fg_color="transparent")
+        behavior_header.grid(row=0, column=0, sticky="ew", pady=(0,20))
+        ctk.CTkLabel(behavior_header, text="Behavior", font=styles_obj.TITLE_2_FONT).grid(row=0, column=0, sticky="w")
+        ctk.CTkLabel(behavior_header, text="Configure how destination folders are organized", font=styles_obj.SUBHEADLINE_FONT, text_color="#9ca3af").grid(row=1, column=0, sticky="w", pady=(4,0))
+        current_cfg2 = load_config(); current_mode = current_cfg2.get("organize_mode", "current")
+        mode_var = tk.StringVar(value=current_mode)
+        
+        # Group title
+        ctk.CTkLabel(behavior_section, text="Folder Organization Mode", font=styles_obj.HEADLINE_FONT).grid(row=1, column=0, sticky="w", pady=(0,8))
+        radio_frame = ctk.CTkFrame(behavior_section, fg_color="transparent")
+        radio_frame.grid(row=2, column=0, sticky="w")
+        ctk.CTkRadioButton(radio_frame, text="Classic Session", variable=mode_var, value="current", command=lambda: apply_organize_mode(mode_var.get()), font=styles_obj.CALLOUT_FONT).grid(row=0, column=0, sticky="w")
+        ctk.CTkLabel(radio_frame, text="Creates a session folder and organizes by categories (e.g., Session_01/Images).", font=styles_obj.FOOTNOTE_FONT, text_color="#9ca3af").grid(row=1, column=0, sticky="w", pady=(0,8))
+        ctk.CTkRadioButton(radio_frame, text="Chronological (Date First)", variable=mode_var, value="date_then_type", command=lambda: apply_organize_mode(mode_var.get()), font=styles_obj.CALLOUT_FONT).grid(row=2, column=0, sticky="w")
+        ctk.CTkLabel(radio_frame, text="Groups by capture date, then by file type (e.g., 2025/10/22/Images).", font=styles_obj.FOOTNOTE_FONT, text_color="#9ca3af").grid(row=3, column=0, sticky="w", pady=(0,8))
+        ctk.CTkRadioButton(radio_frame, text="Collections (Type First)", variable=mode_var, value="type_then_date", command=lambda: apply_organize_mode(mode_var.get()), font=styles_obj.CALLOUT_FONT).grid(row=4, column=0, sticky="w")
+        ctk.CTkLabel(radio_frame, text="Groups by file type, then by capture date (e.g., Images/2025/10/22).", font=styles_obj.FOOTNOTE_FONT, text_color="#9ca3af").grid(row=5, column=0, sticky="w")
+
+        # Initially show Appearance
+        behavior_section.grid_remove()
+        update_section_view()
+        
         def close_settings():
             try: settings_window.destroy()
             except Exception: pass
             globals()['CURRENT_SETTINGS_WINDOW'] = None
             globals()['USER_INTENDS_SETTINGS'] = False
-        
         settings_window.protocol("WM_DELETE_WINDOW", close_settings)
         
         # Improved close button
@@ -554,15 +705,23 @@ def open_settings():
         left = ttk.Frame(container, width=160)
         left.pack(side="left", fill="y", padx=(0,12))
         ttk.Label(left, text="Settings", font=TITLE_FONT).pack(anchor="w", padx=8, pady=(6,12))
-        ttk.Button(left, text="Appearance").pack(fill="x")
+        def update_section_view():
+            appearance.pack_forget(); behavior.pack_forget()
+            if current_section.get() == "Appearance":
+                appearance.pack(fill="x")
+            else:
+                behavior.pack(fill="x")
+            close_btn.pack(anchor="e", pady=(12,0))
+        def select_section(name):
+            current_section.set(name); update_section_view()
+        ttk.Button(left, text="Appearance", command=lambda: select_section("Appearance")).pack(fill="x")
+        ttk.Button(left, text="Behavior", command=lambda: select_section("Behavior")).pack(fill="x", pady=(4,0))
         
         right = ttk.Frame(container)
         right.pack(side="left", fill="both", expand=True)
         
         appearance = ttk.LabelFrame(right, text="Appearance", padding=12)
-        appearance.pack(fill="x")
         ttk.Label(appearance, text="Theme:").pack(anchor="w", pady=(0,5))
-        
         current_config = load_config(); current_theme = current_config.get("theme", "system")
         theme_var = tk.StringVar(value=current_theme)
         def on_theme_change(): apply_theme(theme_var.get())
@@ -571,6 +730,18 @@ def open_settings():
         ttk.Radiobutton(radios, text="Dark", variable=theme_var, value="dark", command=on_theme_change).pack(anchor="w")
         ttk.Radiobutton(radios, text="System", variable=theme_var, value="system", command=on_theme_change).pack(anchor="w")
         
+        behavior = ttk.LabelFrame(right, text="Behavior", padding=12)
+        ttk.Label(behavior, text="Folder Organization Mode:").pack(anchor="w", pady=(0,5))
+        current_mode = current_config.get("organize_mode", "current")
+        mode_var = tk.StringVar(value=current_mode)
+        def on_mode_change(): apply_organize_mode(mode_var.get())
+        ttk.Radiobutton(behavior, text="Classic Session", variable=mode_var, value="current", command=on_mode_change).pack(anchor="w")
+        ttk.Label(behavior, text="Creates a session folder and organizes by categories (e.g., Session_01/Images).", foreground="#6b7280").pack(anchor="w", padx=(24,0), pady=(0,8))
+        ttk.Radiobutton(behavior, text="Chronological (Date First)", variable=mode_var, value="date_then_type", command=on_mode_change).pack(anchor="w")
+        ttk.Label(behavior, text="Groups by capture date, then by file type (e.g., 2025/10/22/Images).", foreground="#6b7280").pack(anchor="w", padx=(24,0), pady=(0,8))
+        ttk.Radiobutton(behavior, text="Collections (Type First)", variable=mode_var, value="type_then_date", command=on_mode_change).pack(anchor="w")
+        ttk.Label(behavior, text="Groups by file type, then by capture date (e.g., Images/2025/10/22).", foreground="#6b7280").pack(anchor="w", padx=(24,0))
+
         def close_settings():
             try: settings_window.destroy()
             except Exception: pass

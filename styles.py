@@ -57,7 +57,8 @@ def apply_styles(root: tk.Misc, use_ctk: bool = True) -> Styles:
 
     if use_ctk and ctk is not None:
         try:
-            ctk.set_appearance_mode("dark")
+            # No forzar modo (light/dark); respetar el tema guardado y el actual.
+            # Mantener solo el tema de colores por defecto.
             ctk.set_default_color_theme("blue")
             
             # Jerarquía tipográfica al estilo Apple
