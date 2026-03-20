@@ -1,7 +1,7 @@
 {
   "type": "module",
   "name": "archivium",
-  "version": "1.2.0",
+  "version": "2.0.0",
   "description": "Media organization tool for photographers and videographers",
   "author": {
     "name": "Rubicel",
