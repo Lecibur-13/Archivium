@@ -3,6 +3,10 @@
   "name": "archivium",
   "version": "1.2.0",
   "description": "Media organization tool for photographers and videographers",
+  "author": {
+    "name": "Rubicel",
+    "email": "rubicelperezcordova0913@gmail.com"
+  },
   "main": "dist-electron/main/index.js",
   "scripts": {
     "dev": "electron-vite dev",
