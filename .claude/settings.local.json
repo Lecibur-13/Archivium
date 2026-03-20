@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm install:*)",
+      "Bash(npm run:*)",
+      "Bash(ls \"D:/develop/APOLO/Archivium/electron-builder.config\"*)",
+      "Bash(node -e \"const c = require\\(''''./electron-builder.config.js''''\\); console.log\\(JSON.stringify\\(c, null, 2\\)\\)\")",
+      "Bash(node -e \":*)",
+      "Bash(python -c \"from PIL import Image; print\\(''Pillow ok''\\)\")",
+      "Bash(python3 -c \"from PIL import Image; print\\(''Pillow ok''\\)\")",
+      "Bash(npx electron-builder:*)"
+    ]
+  }
+}
